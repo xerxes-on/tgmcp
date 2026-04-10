@@ -1,4 +1,4 @@
-# mcp-xerxes-tg
+# tgmcp
 
 `mcp-xerxes-tg` is an MCP server for Telegram built on top of Telethon and MTProto.
 
