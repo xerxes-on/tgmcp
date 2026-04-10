@@ -85,12 +85,55 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
         raise RuntimeError(f"Caught Exception. Error: {e}") from e
 
 
+# ---------------------------------------------------------------------------
+# Listener auto-start
+# ---------------------------------------------------------------------------
+
+
+async def _start_listener_background() -> None:
+    """Start the Telegram listener as a background task if enabled."""
+    from .listener import TelegramAutoListener
+    from .telegram import create_listener_client, get_settings
+
+    settings = get_settings()
+    if not settings.listener_enabled:
+        return
+
+    if not settings.listener_chats.strip():
+        logger.debug("Listener enabled but no chats configured — skipping")
+        return
+
+    logger.info("Auto-starting Telegram listener...")
+    client = create_listener_client()
+    listener = TelegramAutoListener(client)
+
+    try:
+        await listener.run()
+    except Exception:
+        logger.exception("Listener crashed — MCP server continues")
+
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
+
 async def run_mcp_server() -> None:
-    # Import here to avoid issues with event loops
     from mcp.server.stdio import stdio_server
 
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    # Start listener in background (if enabled)
+    listener_task = asyncio.create_task(_start_listener_background())
+
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+    finally:
+        # MCP server closed — clean up listener
+        listener_task.cancel()
+        try:
+            await listener_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def main() -> None:
