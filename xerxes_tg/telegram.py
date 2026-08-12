@@ -1,6 +1,8 @@
 # ruff: noqa: T201
 from __future__ import annotations
 
+import logging
+import shutil
 from functools import cache
 from getpass import getpass
 from pathlib import Path
@@ -11,21 +13,70 @@ from telethon.errors.rpcerrorlist import SessionPasswordNeededError  # type: ign
 from telethon.tl.types import User  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_config_home, xdg_state_home  # type: ignore[import-error]
 
-CONFIG_DIR = xdg_config_home() / "mcp-telegram"
+logger = logging.getLogger(__name__)
+
+CONFIG_DIR = xdg_config_home() / "xerxes-tg"
 CONFIG_ENV = CONFIG_DIR / "config.env"
-LISTENER_MODE_ALIASES = {
-    "read": "read",
-    "read-only": "read",
-    "readonly": "read",
-    "ask": "ask",
-    "ask-first": "ask",
-    "always-ask-first": "ask",
-    "auto": "auto",
-    "auto-reply": "auto",
-    "always-auto-reply": "auto",
-    "decide": "decide",
-    "agent-decides": "decide",
-}
+
+_LEGACY_CONFIG_DIR = xdg_config_home() / "mcp-telegram"
+_LEGACY_STATE_DIR = xdg_state_home() / "mcp-telegram"
+_SESSION_NAME = "xerxes_tg_session"
+_LEGACY_SESSION_NAME = "mcp_telegram_session"
+
+_MIGRATED = False
+
+
+def _migrate_legacy_paths() -> None:
+    """One-time migration from ~/.config/mcp-telegram → ~/.config/xerxes-tg.
+
+    Copies config and session files, stripping legacy TELEGRAM_LISTENER_* keys.
+    Legacy directories are left in place as a safety net.
+    """
+    global _MIGRATED  # noqa: PLW0603
+    if _MIGRATED:
+        return
+    _MIGRATED = True
+
+    # --- config ---
+    legacy_cfg = _LEGACY_CONFIG_DIR / "config.env"
+    if not CONFIG_ENV.exists() and legacy_cfg.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        raw = legacy_cfg.read_text()
+        cleaned = "\n".join(
+            line for line in raw.splitlines() if not line.lstrip().startswith("TELEGRAM_LISTENER_")
+        )
+        if not cleaned.endswith("\n"):
+            cleaned += "\n"
+        CONFIG_ENV.write_text(cleaned)
+        logger.info("xerxes-tg: migrated config from %s to %s", _LEGACY_CONFIG_DIR, CONFIG_DIR)
+
+    # --- session ---
+    new_state = xdg_state_home() / "xerxes-tg"
+    new_session = new_state / f"{_SESSION_NAME}.session"
+    legacy_session = _LEGACY_STATE_DIR / f"{_LEGACY_SESSION_NAME}.session"
+    if not new_session.exists() and legacy_session.exists():
+        new_state.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy_session, new_session)
+        for suffix in ("-journal", "-wal", "-shm"):
+            extra = legacy_session.with_name(legacy_session.name + suffix)
+            if extra.exists():
+                shutil.copy2(
+                    extra,
+                    new_state / extra.name.replace(_LEGACY_SESSION_NAME, _SESSION_NAME),
+                )
+        logger.info("xerxes-tg: migrated session from %s to %s", legacy_session, new_session)
+
+
+# Run migration at import time so settings pick up the new location.
+_migrate_legacy_paths()
+
+# Migrate legacy plaintext SQLite session to encrypted StringSession.
+try:
+    from . import session as _session_module
+
+    _session_module.migrate_legacy_sqlite()
+except Exception:  # keyring or crypto may fail in constrained envs
+    logger.exception("xerxes-tg: session migration failed — continuing with plaintext session")
 
 
 def _parse_chat_ids(raw: str) -> list[int]:
@@ -60,54 +111,17 @@ def _resolve_dialog_id_raw(dialog_id: int | str, aliases: dict[str, int]) -> int
     return int(dialog_id)
 
 
-def _parse_listener_chats(raw: str, aliases: dict[str, int]) -> dict[int, str]:
-    mapping: dict[int, str] = {}
-    if not raw or not raw.strip():
-        return mapping
-
-    for pair in raw.split(","):
-        item = pair.strip()
-        if not item or "=" not in item:
-            continue
-
-        dialog_id, _, mode = item.partition("=")
-        normalized_mode = LISTENER_MODE_ALIASES.get(mode.strip().lower())
-        if not normalized_mode:
-            continue
-
-        try:
-            resolved_id = _resolve_dialog_id_raw(dialog_id.strip(), aliases)
-        except ValueError:
-            continue
-
-        mapping[resolved_id] = normalized_mode
-
-    return mapping
-
-
 class TelegramSettings(BaseSettings):
     api_id: str = ""
     api_hash: str = ""
     read_chats: str = ""
     write_chats: str = ""
     aliases: str = ""
-    listener_enabled: bool = False
-    listener_chats: str = ""
-    listener_approval_chat: str = ""
-    listener_agent_cmd: str = ""
-    listener_system_prompt: str = ""
-    listener_claude_path: str = "claude"
-    listener_claude_cwd: str = ""
-    listener_timeout: int = 120
-    listener_context_messages: int = 7
-    listener_rate_limit_count: int = 5
-    listener_rate_limit_window: int = 300
-    listener_cooldown: int = 5
-    listener_approval_ttl: int = 3600
 
     class Config:
         env_prefix = "TELEGRAM_"
         env_file = str(CONFIG_ENV) if CONFIG_ENV.exists() else ".env"
+        extra = "ignore"
 
     @property
     def read_chat_ids(self) -> list[int]:
@@ -120,10 +134,6 @@ class TelegramSettings(BaseSettings):
     @property
     def alias_map(self) -> dict[str, int]:
         return _parse_aliases(self.aliases)
-
-    @property
-    def listener_chat_modes(self) -> dict[int, str]:
-        return _parse_listener_chats(self.listener_chats, self.alias_map)
 
 
 @cache
@@ -174,6 +184,8 @@ def get_allowed_chat_ids() -> set[int] | None:
 
 
 async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> None:
+    from . import session as _session
+
     user_session = create_client(api_id=api_id, api_hash=api_hash)
     await user_session.connect()
 
@@ -189,18 +201,23 @@ async def connect_to_telegram(api_id: str, api_hash: str, phone_number: str) -> 
         password = getpass("Enter 2FA password: ")
         await user_session.sign_in(password=password)
 
+    _session.save_session(user_session)
+
     user = await user_session.get_me()
     if isinstance(user, User):
         print(f"Hey {user.username}! You are connected!")
     else:
         print("Connected!")
-    print("You can now use the mcp-telegram server.")
+    print("You can now use the xerxes-tg server.")
 
 
 async def logout_from_telegram() -> None:
+    from . import session as _session
+
     user_session = create_client()
     await user_session.connect()
     await user_session.log_out()
+    _session.delete_session()
     print("You are now logged out from Telegram.")
 
 
@@ -208,30 +225,31 @@ async def logout_from_telegram() -> None:
 def create_client(
     api_id: str | None = None,
     api_hash: str | None = None,
-    session_name: str = "mcp_telegram_session",
+    session_name: str = _SESSION_NAME,  # noqa: ARG001 — retained for API compat
 ) -> TelegramClient:
+    return create_ephemeral_client(api_id=api_id, api_hash=api_hash)
+
+
+def create_ephemeral_client(
+    api_id: str | None = None,
+    api_hash: str | None = None,
+) -> TelegramClient:
+    from . import session as _session
+
     if api_id is not None and api_hash is not None:
         config = TelegramSettings(api_id=api_id, api_hash=api_hash)
     else:
         config = TelegramSettings()
-    state_home = xdg_state_home() / "mcp-telegram"
-    state_home.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(state_home / session_name, config.api_id, config.api_hash, base_logger="telethon")
-
-
-def create_listener_client() -> TelegramClient:
-    """Create a separate (non-cached) Telethon client for the listener.
-
-    Uses the same session file so no re-authentication is needed,
-    but a distinct client instance so connect/disconnect from MCP tools
-    doesn't kill the listener's long-lived connection.
-    """
-    config = TelegramSettings()
-    state_home = xdg_state_home() / "mcp-telegram"
-    state_home.mkdir(parents=True, exist_ok=True)
     return TelegramClient(
-        state_home / "mcp_telegram_session",
+        _session.load_session(),
         config.api_id,
         config.api_hash,
-        base_logger="telethon.listener",
+        base_logger="telethon",
     )
+
+
+def persist_session(client: TelegramClient) -> None:
+    """Encrypt and save the client's current session state."""
+    from . import session as _session
+
+    _session.save_session(client)

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import random
+import re
 import sys
 import typing as t
+from datetime import datetime, timedelta, timezone
 from functools import singledispatch
 
 from mcp.types import (
@@ -14,11 +18,98 @@ from mcp.types import (
     Tool,
 )
 from pydantic import BaseModel, ConfigDict
-from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
+from telethon import TelegramClient, custom, functions, types, utils  # type: ignore[import-untyped]
 
-from .telegram import check_access, create_client, get_aliases, get_allowed_chat_ids, resolve_dialog_id
+from .telegram import (
+    check_access,
+    create_client,
+    create_ephemeral_client,
+    get_aliases,
+    get_allowed_chat_ids,
+    resolve_dialog_id,
+)
+
+
+def _parse_send_at(raw: str) -> datetime:
+    """Parse a schedule spec into a timezone-aware datetime.
+
+    Accepts ISO-8601 (``2026-04-14T10:00``), relative offsets (``+10m``,
+    ``+2h``, ``+3d``), or natural forms (``tomorrow 09:00``, ``today 18:30``).
+    Returns a ``datetime`` in the local timezone.
+    """
+    raw = raw.strip()
+    now = datetime.now().astimezone()
+
+    # Relative: +<N><unit>
+    m = re.fullmatch(r"\+(\d+)\s*([smhd])", raw, re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        delta = {"s": timedelta(seconds=n), "m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+        return now + delta
+
+    # today/tomorrow HH:MM
+    m = re.fullmatch(r"(today|tomorrow)\s+(\d{1,2}):(\d{2})", raw, re.IGNORECASE)
+    if m:
+        offset = 0 if m.group(1).lower() == "today" else 1
+        target = now.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0) + timedelta(days=offset)
+        return target
+
+    # ISO-8601
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"Could not parse send_at {raw!r}. Use ISO-8601 (2026-04-14T10:00), "
+            f"relative (+10m, +2h, +3d), or 'tomorrow HH:MM'."
+        ) from e
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
+
+
+def _resolve_entity_ref(entity: int | str) -> int | str:
+    if isinstance(entity, int):
+        return entity
+
+    raw = entity.strip()
+    try:
+        return resolve_dialog_id(raw)
+    except ValueError:
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        return raw
+
+
+async def _get_entity(client: TelegramClient, entity: int | str):  # noqa: ANN202
+    if isinstance(entity, str) and not entity.strip().lstrip("-").isdigit():
+        try:
+            return await client.get_entity(entity.strip())
+        except ValueError:
+            pass
+
+    return await client.get_entity(_resolve_entity_ref(entity))
+
+
+def _theme_params(raw: str | None) -> types.DataJSON | None:
+    if not raw:
+        return None
+
+    try:
+        json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError("theme_params_json must be valid JSON") from e
+
+    return types.DataJSON(data=raw)
 
 logger = logging.getLogger(__name__)
+_BACKGROUND_UPLOADS: set[asyncio.Task[None]] = set()
+_DEFAULT_BACKGROUND_UPLOAD_MB = 0
+_AGENT_FOOTER = "\n\n`sent via agent`"
+
+
+def _add_footer(text: str) -> str:
+    return text.rstrip() + _AGENT_FOOTER if text.strip() else "`sent via agent`"
 
 
 class ToolArgs(BaseModel):
@@ -158,13 +249,20 @@ async def list_messages(
 
 
 class SendMessage(ToolArgs):
-    """Send a text message to a dialog, chat or channel. Use parse_mode='md' for Markdown or 'html' for HTML formatting."""
+    """Send a text message to a dialog, chat or channel.
+
+    Use parse_mode='md' for Markdown or 'html' for HTML formatting.
+    Set send_at to schedule the message for later: accepts ISO-8601
+    ('2026-04-14T10:00'), relative offsets ('+10m', '+2h', '+3d'),
+    or 'tomorrow HH:MM'/'today HH:MM'.
+    """
 
     dialog_id: int | str
     message: str
     parse_mode: str = "md"
     reply_to: int | None = None
     link_preview: bool = True
+    send_at: str | None = None
 
 
 @tool_runner.register
@@ -177,6 +275,13 @@ async def send_message(
 
     msg = args.message.rstrip() + "\n\n`sent via agent`"
     parse_mode = args.parse_mode if args.parse_mode else None
+
+    schedule_dt: datetime | None = None
+    if args.send_at:
+        schedule_dt = _parse_send_at(args.send_at)
+        if schedule_dt <= datetime.now().astimezone():
+            raise ValueError(f"send_at must be in the future (got {schedule_dt.isoformat()})")
+
     async with create_client() as client:
         result = await client.send_message(
             entity=did,
@@ -184,7 +289,10 @@ async def send_message(
             parse_mode=parse_mode,
             reply_to=args.reply_to,
             link_preview=args.link_preview,
+            schedule=schedule_dt,
         )
+        if schedule_dt is not None:
+            return [TextContent(type="text", text=f"Scheduled for {schedule_dt.isoformat()}. id={result.id}")]
         return [TextContent(type="text", text=f"Message sent. id={result.id}")]
 
 
@@ -213,7 +321,7 @@ async def edit_message(
         result = await client.edit_message(
             entity=did,
             message=args.message_id,
-            text=args.new_text,
+            text=_add_footer(args.new_text),
             parse_mode=parse_mode,
         )
         return [TextContent(type="text", text=f"Message edited. id={result.id}")]
@@ -319,6 +427,7 @@ class SendFile(ToolArgs):
     caption: str = ""
     reply_to: int | None = None
     force_document: bool = False
+    wait_for_upload: bool = False
 
 
 @tool_runner.register
@@ -332,15 +441,62 @@ async def send_file(
     if not os.path.exists(args.file_path):
         raise FileNotFoundError(f"File not found: {args.file_path}")
 
+    size = os.path.getsize(args.file_path)
+    threshold = _background_upload_threshold_bytes()
+    if not args.wait_for_upload:
+        task = asyncio.create_task(_send_file_background(did, args), name=f"SendFile:{args.file_path}")
+        _BACKGROUND_UPLOADS.add(task)
+        task.add_done_callback(_finish_background_upload)
+
+        size_mb = size / 1024 / 1024
+        threshold_mb = threshold / 1024 / 1024
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"File upload queued in background ({size_mb:.1f} MB; "
+                    f"sync threshold {threshold_mb:.1f} MB)."
+                ),
+            )
+        ]
+
     async with create_client() as client:
         result = await client.send_file(
             entity=did,
             file=args.file_path,
-            caption=args.caption,
+            caption=_add_footer(args.caption),
             reply_to=args.reply_to,
             force_document=args.force_document,
         )
         return [TextContent(type="text", text=f"File sent. id={result.id}")]
+
+
+def _background_upload_threshold_bytes() -> int:
+    raw = os.environ.get("TELEGRAM_BACKGROUND_UPLOAD_THRESHOLD_MB")
+    if raw and raw.strip().isdigit():
+        return max(1, int(raw.strip())) * 1024 * 1024
+
+    return _DEFAULT_BACKGROUND_UPLOAD_MB * 1024 * 1024
+
+
+async def _send_file_background(did: int, args: SendFile) -> None:
+    async with create_ephemeral_client() as client:
+        result = await client.send_file(
+            entity=did,
+            file=args.file_path,
+            caption=_add_footer(args.caption),
+            reply_to=args.reply_to,
+            force_document=args.force_document,
+        )
+        logger.info("background SendFile completed file[%s] message_id[%s]", args.file_path, result.id)
+
+
+def _finish_background_upload(task: asyncio.Task[None]) -> None:
+    _BACKGROUND_UPLOADS.discard(task)
+    try:
+        task.result()
+    except Exception:
+        logger.exception("background SendFile failed")
 
 
 ### DownloadMedia ###
@@ -423,6 +579,160 @@ async def get_me(
         me = await client.get_me()
         info = f"id={me.id} username={me.username} first_name={me.first_name} last_name={me.last_name} phone={me.phone}"
         return [TextContent(type="text", text=info)]
+
+
+### LaunchMiniApp ###
+
+
+class LaunchMiniApp(ToolArgs):
+    """Generate an authenticated Telegram Mini App WebView URL.
+
+    Use this when the user asks to open or work with a Telegram Mini App.
+    The returned URL is authenticated as the user's Telegram account and
+    should be treated as a secret. Open it with browser automation to interact
+    with the Mini App UI.
+
+    Modes:
+    - auto: choose app if app_short_name is set, web if peer+url are set,
+      simple if no peer is set, otherwise main.
+    - app: launch a bot app by short name, e.g. t.me/<bot>/<short_name>.
+    - main: launch the bot's main/menu Mini App in a peer context.
+    - web: launch a specific bot WebView URL in a peer context.
+    - simple: launch a simple bot WebView without a peer context.
+    """
+
+    bot: int | str
+    peer: int | str | None = None
+    mode: t.Literal["auto", "app", "main", "web", "simple"] = "auto"
+    app_short_name: str | None = None
+    url: str | None = None
+    start_param: str | None = None
+    platform: str = "web"
+    write_allowed: bool = False
+    compact: bool = False
+    fullscreen: bool = True
+    theme_params_json: str | None = None
+
+
+@tool_runner.register
+async def launch_mini_app(
+    args: LaunchMiniApp,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[LaunchMiniApp] args[%s]", args)
+
+    if args.mode == "app" and not args.app_short_name:
+        raise ValueError("app_short_name is required when mode='app'")
+    if args.mode in {"main", "web"} and args.peer is None:
+        raise ValueError(f"peer is required when mode='{args.mode}'")
+    if args.mode == "web" and not args.url:
+        raise ValueError("url is required when mode='web'")
+
+    selected_mode = args.mode
+    if selected_mode == "auto":
+        if args.app_short_name:
+            selected_mode = "app"
+        elif args.peer is not None and args.url:
+            selected_mode = "web"
+        elif args.peer is None:
+            selected_mode = "simple"
+        else:
+            selected_mode = "main"
+
+    async with create_client() as client:
+        bot_entity = await _get_entity(client, args.bot)
+        check_access(utils.get_peer_id(bot_entity), "read")
+        bot_input = utils.get_input_user(bot_entity)
+
+        peer_entity = None
+        peer_input = None
+        if args.peer is not None:
+            peer_entity = await _get_entity(client, args.peer)
+            check_access(utils.get_peer_id(peer_entity), "read")
+            peer_input = utils.get_input_peer(peer_entity)
+        elif selected_mode in {"app", "main", "web"}:
+            peer_entity = bot_entity
+            peer_input = utils.get_input_peer(bot_entity)
+
+        theme_params = _theme_params(args.theme_params_json)
+
+        if selected_mode == "app":
+            if peer_input is None:
+                raise ValueError("peer is required to launch a bot app by short name")
+            result = await client(
+                functions.messages.RequestAppWebViewRequest(
+                    peer=peer_input,
+                    app=types.InputBotAppShortName(
+                        bot_id=bot_input,
+                        short_name=args.app_short_name or "",
+                    ),
+                    platform=args.platform,
+                    write_allowed=args.write_allowed,
+                    compact=args.compact,
+                    fullscreen=args.fullscreen,
+                    start_param=args.start_param,
+                    theme_params=theme_params,
+                )
+            )
+        elif selected_mode == "main":
+            if peer_input is None:
+                raise ValueError("peer is required to launch the main bot Mini App")
+            result = await client(
+                functions.messages.RequestMainWebViewRequest(
+                    peer=peer_input,
+                    bot=bot_input,
+                    platform=args.platform,
+                    compact=args.compact,
+                    fullscreen=args.fullscreen,
+                    start_param=args.start_param,
+                    theme_params=theme_params,
+                )
+            )
+        elif selected_mode == "web":
+            if peer_input is None:
+                raise ValueError("peer is required to launch a peer WebView")
+            result = await client(
+                functions.messages.RequestWebViewRequest(
+                    peer=peer_input,
+                    bot=bot_input,
+                    platform=args.platform,
+                    url=args.url,
+                    compact=args.compact,
+                    fullscreen=args.fullscreen,
+                    start_param=args.start_param,
+                    theme_params=theme_params,
+                )
+            )
+        elif selected_mode == "simple":
+            result = await client(
+                functions.messages.RequestSimpleWebViewRequest(
+                    bot=bot_input,
+                    platform=args.platform,
+                    url=args.url,
+                    start_param=args.start_param,
+                    compact=args.compact,
+                    fullscreen=args.fullscreen,
+                    theme_params=theme_params,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported Mini App mode: {selected_mode}")
+
+        webview_url = getattr(result, "url", None)
+        if not webview_url:
+            raise TypeError(f"Telegram returned {type(result).__name__} without a url")
+
+        peer_id = utils.get_peer_id(peer_entity) if peer_entity is not None else ""
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "Authenticated Telegram Mini App URL generated.\n"
+                    "Treat this URL as secret; it is authenticated as the Telegram account.\n"
+                    f"mode={selected_mode} bot_id={utils.get_peer_id(bot_entity)} peer_id={peer_id}\n"
+                    f"url={webview_url}"
+                ),
+            )
+        ]
 
 
 ### SendSticker ###
@@ -860,3 +1170,423 @@ async def list_aliases(
 
     lines = [f"{name} => {cid}" for name, cid in aliases.items()]
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+### SearchAllMessages ###
+
+
+class SearchAllMessages(ToolArgs):
+    """Global search across every chat reachable by the configured ACL.
+
+    Wraps Telegram's server-side global search and filters out results from
+    dialogs outside the read/write allowlist.
+    """
+
+    query: str
+    limit: int = 30
+
+
+@tool_runner.register
+async def search_all_messages(
+    args: SearchAllMessages,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[SearchAllMessages] args[%s]", args)
+
+    allowed = get_allowed_chat_ids()
+
+    response: list[TextContent] = []
+    async with create_client() as client:
+        async for message in client.iter_messages(entity=None, search=args.query, limit=args.limit):
+            chat_id = message.chat_id if hasattr(message, "chat_id") else None
+            if allowed is not None and chat_id not in allowed:
+                continue
+            sender = ""
+            if message.sender:
+                if hasattr(message.sender, "first_name"):
+                    sender = message.sender.first_name or ""
+                elif hasattr(message.sender, "title"):
+                    sender = message.sender.title or ""
+            text = message.text or (f"[media: {type(message.media).__name__}]" if message.media else "")
+            response.append(
+                TextContent(
+                    type="text",
+                    text=f"[chat={chat_id} id={message.id} date={message.date}] {sender}: {text}",
+                )
+            )
+
+    if not response:
+        return [TextContent(type="text", text=f"No messages found matching '{args.query}'")]
+    return response
+
+
+### GetThread ###
+
+
+class GetThread(ToolArgs):
+    """Return the full reply-thread containing a given message.
+
+    Walks upward from ``message_id`` to find the thread root, then fetches the
+    discussion under it. Output is ordered from oldest to newest, indented by
+    reply depth.
+    """
+
+    dialog_id: int | str
+    message_id: int
+    depth: int = 50
+
+
+@tool_runner.register
+async def get_thread(
+    args: GetThread,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[GetThread] args[%s]", args)
+    did = resolve_dialog_id(args.dialog_id)
+    check_access(did, "read")
+
+    async with create_client() as client:
+        # Walk upward to find root.
+        root_id = args.message_id
+        seen: set[int] = set()
+        while True:
+            if root_id in seen:
+                break
+            seen.add(root_id)
+            msg = await client.get_messages(did, ids=root_id)
+            if not msg:
+                break
+            if isinstance(msg, list):
+                msg = msg[0]
+            if not getattr(msg, "reply_to", None) or not msg.reply_to.reply_to_msg_id:
+                break
+            root_id = msg.reply_to.reply_to_msg_id
+
+        # Collect the root + its replies (if any) via GetRepliesRequest.
+        collected: list[custom.Message] = []
+        try:
+            root_msg = await client.get_messages(did, ids=root_id)
+            if root_msg:
+                if isinstance(root_msg, list):
+                    root_msg = root_msg[0]
+                collected.append(root_msg)
+        except Exception:
+            pass
+
+        try:
+            async for m in client.iter_messages(did, reply_to=root_id, limit=args.depth):
+                collected.append(m)
+        except Exception:
+            # Not all chats support threaded replies (e.g. private DMs).
+            # Fall back to scanning recent messages for reply_to == root_id.
+            async for m in client.iter_messages(did, limit=200):
+                if m.reply_to and m.reply_to.reply_to_msg_id == root_id:
+                    collected.append(m)
+
+        # De-dup and sort by id asc.
+        uniq: dict[int, custom.Message] = {}
+        for m in collected:
+            uniq[m.id] = m
+        ordered = sorted(uniq.values(), key=lambda m: m.id)
+
+        # Compute depth per message (1 for root, 2+ for nested replies).
+        depth_by_id: dict[int, int] = {root_id: 0}
+        for m in ordered:
+            if m.id == root_id:
+                continue
+            parent = m.reply_to.reply_to_msg_id if m.reply_to else root_id
+            depth_by_id[m.id] = depth_by_id.get(parent, 0) + 1
+
+        response: list[TextContent] = []
+        for m in ordered:
+            sender = ""
+            if m.sender:
+                if hasattr(m.sender, "first_name"):
+                    sender = m.sender.first_name or ""
+                elif hasattr(m.sender, "title"):
+                    sender = m.sender.title or ""
+            text = m.text or (f"[media: {type(m.media).__name__}]" if m.media else "")
+            indent = "  " * depth_by_id.get(m.id, 0)
+            response.append(
+                TextContent(
+                    type="text",
+                    text=f"{indent}[id={m.id}] {sender}: {text}",
+                )
+            )
+
+    if not response:
+        return [TextContent(type="text", text=f"No thread found for message {args.message_id}")]
+    return response
+
+
+### ReplyTo ###
+
+
+class ReplyTo(ToolArgs):
+    """Find the most recent message matching a predicate and reply to it.
+
+    Specify any combination of:
+    - ``from_user``: only messages from this user (alias or numeric id)
+    - ``contains``: substring that must appear in the message text
+    - ``since_seconds``: only messages newer than N seconds ago
+    - ``unread_only``: only consider unread messages
+
+    The latest match wins. Fails with a clear error if no message matches.
+    """
+
+    dialog_id: int | str
+    text: str
+    from_user: int | str | None = None
+    contains: str | None = None
+    since_seconds: int | None = None
+    unread_only: bool = False
+    parse_mode: str = "md"
+
+
+@tool_runner.register
+async def reply_to(
+    args: ReplyTo,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[ReplyTo] args[%s]", args)
+    did = resolve_dialog_id(args.dialog_id)
+    check_access(did, "write")
+
+    iter_kwargs: dict[str, t.Any] = {"entity": did, "limit": 200}
+    if args.from_user is not None:
+        iter_kwargs["from_user"] = resolve_dialog_id(args.from_user)
+    if args.contains:
+        iter_kwargs["search"] = args.contains
+
+    cutoff_dt: datetime | None = None
+    if args.since_seconds is not None:
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(seconds=args.since_seconds)
+
+    matched: custom.Message | None = None
+    async with create_client() as client:
+        if args.unread_only:
+            # Limit to actually unread messages by consulting dialog unread_count.
+            async for dialog in client.iter_dialogs():
+                if dialog.id == did:
+                    iter_kwargs["limit"] = max(1, min(dialog.unread_count or 1, 200))
+                    break
+
+        async for msg in client.iter_messages(**iter_kwargs):
+            if cutoff_dt and msg.date < cutoff_dt:
+                break  # iter_messages is newest-first; older messages can't match.
+            matched = msg
+            break
+
+        if matched is None:
+            raise ValueError("No message matched the given predicate.")
+
+        parse_mode = args.parse_mode if args.parse_mode else None
+        body = args.text.rstrip() + "\n\n`sent via agent`"
+        result = await client.send_message(
+            entity=did,
+            message=body,
+            parse_mode=parse_mode,
+            reply_to=matched.id,
+        )
+        return [
+            TextContent(
+                type="text",
+                text=f"Replied to id={matched.id}. new_id={result.id}",
+            )
+        ]
+
+
+### SearchLocal ###
+
+
+class SearchLocal(ToolArgs):
+    """Full-text search over the local mirror db.
+
+    Run ``xerxes-tg sync`` first to populate the mirror. Results include
+    messages from any chat the mirror has indexed (within your read ACL).
+    """
+
+    query: str
+    dialog_id: int | str | None = None
+    limit: int = 50
+    since_hours: int | None = None
+
+
+@tool_runner.register
+async def search_local(
+    args: SearchLocal,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    logger.info("method[SearchLocal] args[%s]", args)
+    from . import mirror
+
+    did = resolve_dialog_id(args.dialog_id) if args.dialog_id is not None else None
+    allowed = get_allowed_chat_ids()
+
+    rows = mirror.search(
+        query=args.query,
+        dialog_id=did,
+        limit=args.limit,
+        since_hours=args.since_hours,
+    )
+    response: list[TextContent] = []
+    for row in rows:
+        if allowed is not None and row["dialog_id"] not in allowed:
+            continue
+        ts = datetime.fromtimestamp(row["ts"], timezone.utc).isoformat()
+        response.append(
+            TextContent(
+                type="text",
+                text=f"[chat={row['dialog_id']} id={row['message_id']} date={ts}] {row['sender_name']}: {row['text']}",
+            )
+        )
+    if not response:
+        return [TextContent(type="text", text=f"No local matches for {args.query!r}. Run `xerxes-tg sync --all` first.")]
+    return response
+
+
+### Temporary Watches ###
+
+
+class StartWatch(ToolArgs):
+    """Start a durable temporary watch for incoming Telegram messages.
+
+    The watch survives the MCP process and is handled by a background daemon.
+    It expires after ``idle_timeout_seconds`` without a matching message and
+    always stops at ``max_duration_seconds``. Use ``mode='once'`` to stop after
+    the first match, or ``mode='conversation'`` to renew the idle deadline on
+    every match. Webhook destinations and secrets come only from local config.
+    """
+
+    dialog_id: int | str
+    after_message_id: int | None = None
+    reply_to_message_id: int | None = None
+    sender_id: int | None = None
+    mode: t.Literal["once", "conversation"] = "conversation"
+    idle_timeout_seconds: int = 3600
+    max_duration_seconds: int = 86400
+
+
+@tool_runner.register
+async def start_watch_tool(
+    args: StartWatch,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    from . import watch_store, watcher
+    from .webhook import WebhookConfig
+
+    did = resolve_dialog_id(args.dialog_id)
+    check_access(did, "read")
+    if args.after_message_id is not None and args.after_message_id < 1:
+        raise ValueError("after_message_id must be positive")
+    if args.reply_to_message_id is not None and args.reply_to_message_id < 1:
+        raise ValueError("reply_to_message_id must be positive")
+    if args.idle_timeout_seconds < 30:
+        raise ValueError("idle_timeout_seconds must be at least 30")
+    if args.max_duration_seconds < args.idle_timeout_seconds:
+        raise ValueError("max_duration_seconds must be at least idle_timeout_seconds")
+
+    watch = await watch_store.start_watch(
+        dialog_id=did,
+        after_message_id=args.after_message_id,
+        reply_to_message_id=args.reply_to_message_id,
+        sender_id=args.sender_id,
+        mode=args.mode,
+        idle_timeout_seconds=args.idle_timeout_seconds,
+        max_duration_seconds=args.max_duration_seconds,
+    )
+    try:
+        pid = await asyncio.to_thread(watcher.ensure_running)
+    except Exception:
+        await watch_store.stop_watch(watch["watch_id"], reason="watcher_start_failed")
+        raise
+
+    config = WebhookConfig.load()
+    result = {
+        **watch,
+        "watcher_pid": pid,
+        "webhook_configured": config.enabled,
+        "polling_fallback": {
+            "tool": "GetWatchEvents",
+            "watch_id": watch["watch_id"],
+            "after_sequence": 0,
+        },
+    }
+    if not config.enabled:
+        result["warning"] = (
+            "Webhook delivery is disabled until XERXES_TG_WEBHOOK_URL and "
+            "XERXES_TG_WEBHOOK_SECRET are configured; events remain pollable."
+        )
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+
+class StopWatch(ToolArgs):
+    """Stop one temporary Telegram watch immediately."""
+
+    watch_id: str
+
+
+@tool_runner.register
+async def stop_watch_tool(
+    args: StopWatch,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    from . import watch_store
+
+    watch = await watch_store.stop_watch(args.watch_id)
+    if watch is None:
+        raise ValueError(f"Unknown watch_id: {args.watch_id}")
+    return [TextContent(type="text", text=json.dumps(watch, ensure_ascii=False))]
+
+
+class ListWatches(ToolArgs):
+    """List temporary Telegram watches and their lifecycle state."""
+
+    include_inactive: bool = False
+
+
+@tool_runner.register
+async def list_watches_tool(
+    args: ListWatches,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    from . import watch_store, watcher
+    from .webhook import WebhookConfig
+
+    watches = await watch_store.list_watches(include_inactive=args.include_inactive)
+    result = {
+        "watcher_running": watcher.is_running(),
+        "watcher_ready": watcher.is_ready(),
+        "webhook_configured": WebhookConfig.load().enabled,
+        "watches": watches,
+    }
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+
+class GetWatchEvents(ToolArgs):
+    """Poll durable events for a watch when webhook delivery is unavailable.
+
+    Pass the highest previously seen ``sequence`` as ``after_sequence`` to
+    receive only newer events. This operation does not delete or acknowledge
+    events, so repeated calls are safe.
+    """
+
+    watch_id: str
+    after_sequence: int = 0
+    limit: int = 100
+
+
+@tool_runner.register
+async def get_watch_events_tool(
+    args: GetWatchEvents,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    from . import watch_store
+
+    if args.after_sequence < 0:
+        raise ValueError("after_sequence cannot be negative")
+    if not 1 <= args.limit <= 500:
+        raise ValueError("limit must be between 1 and 500")
+    events = await watch_store.get_events(
+        args.watch_id,
+        after_sequence=args.after_sequence,
+        limit=args.limit,
+    )
+    result = {
+        "watch_id": args.watch_id,
+        "events": events,
+        "next_after_sequence": events[-1]["sequence"] if events else args.after_sequence,
+    }
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]

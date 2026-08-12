@@ -18,11 +18,13 @@ from mcp.types import (
     Tool,
 )
 
-from . import tools
+from . import audit, ratelimit, tools
+from .instructions import INSTRUCTIONS
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-app = Server("mcp-telegram")
+logger.warning("xerxes-tg loading tools from %s", getattr(tools, "__file__", "<unknown>"))
+app = Server("xerxes-tg", instructions=INSTRUCTIONS)
 
 
 @cache
@@ -79,38 +81,46 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
 
     try:
         args = tools.tool_args(tool, **arguments)
-        return await tools.tool_runner(args)
     except Exception as e:
+        audit.write(name, arguments, ok=False, error=f"bad_args: {e}")
+        raise RuntimeError(f"Invalid arguments for {name}: {e}") from e
+
+    # Local rate-limit (pre-flight). Gets logged via audit on rejection.
+    action = ratelimit.classify_tool(name)
+    if action:
+        did = getattr(args, "dialog_id", None)
+        key: int | None
+        if isinstance(did, str):
+            key = hash(did.lower())
+        elif isinstance(did, int):
+            key = did
+        else:
+            key = None
+        try:
+            ratelimit.check_and_consume(action, key)
+        except ratelimit.RateLimitExceeded as e:
+            audit.write(name, arguments, ok=False, error=f"rate_limit: {e}")
+            raise RuntimeError(str(e)) from e
+
+    try:
+        result = await tools.tool_runner(args)
+    except Exception as e:
+        audit.write(name, arguments, ok=False, error=f"{type(e).__name__}: {e}")
         logger.exception("Error running tool: %s", name)
         raise RuntimeError(f"Caught Exception. Error: {e}") from e
 
-
-# ---------------------------------------------------------------------------
-# Listener auto-start
-# ---------------------------------------------------------------------------
-
-
-async def _start_listener_background() -> None:
-    """Start the Telegram listener as a background task if enabled."""
-    from .listener import TelegramAutoListener
-    from .telegram import create_listener_client, get_settings
-
-    settings = get_settings()
-    if not settings.listener_enabled:
-        return
-
-    if not settings.listener_chats.strip():
-        logger.debug("Listener enabled but no chats configured — skipping")
-        return
-
-    logger.info("Auto-starting Telegram listener...")
-    client = create_listener_client()
-    listener = TelegramAutoListener(client)
-
+    preview = ""
     try:
-        await listener.run()
+        if isinstance(result, list) and result:
+            first_text = getattr(result[0], "text", "")
+            if name == "LaunchMiniApp":
+                preview = "[authenticated Mini App URL redacted]"
+            else:
+                preview = first_text[:200]
     except Exception:
-        logger.exception("Listener crashed — MCP server continues")
+        preview = ""
+    audit.write(name, arguments, ok=True, result_preview=preview)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -121,19 +131,8 @@ async def _start_listener_background() -> None:
 async def run_mcp_server() -> None:
     from mcp.server.stdio import stdio_server
 
-    # Start listener in background (if enabled)
-    listener_task = asyncio.create_task(_start_listener_background())
-
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(read_stream, write_stream, app.create_initialization_options())
-    finally:
-        # MCP server closed — clean up listener
-        listener_task.cancel()
-        try:
-            await listener_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
 def main() -> None:

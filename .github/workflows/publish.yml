@@ -38,7 +38,7 @@ jobs:
     needs: build
     environment:
       name: pypi
-      url: https://pypi.org/p/mcp-xerxes-tg
+      url: https://pypi.org/p/xerxes-tg
     steps:
       - name: Download distributions
         uses: actions/download-artifact@v4

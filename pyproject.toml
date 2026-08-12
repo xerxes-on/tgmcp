@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mcp-xerxes-tg"
-version = "0.3.0"
+name = "xerxes-tg"
+version = "0.5.1"
 description = "MCP server to work with Telegram through MTProto — with ACL and multi-agent setup"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,11 +32,16 @@ dependencies = [
     "typer>=0.15.0",
     "xdg-base-dirs>=6.0.0",
     "terminaltexteffects>=0.14.2",
+    "keyring>=25.0.0",
+    "cryptography>=42.0.0",
+    "aiosqlite>=0.20.0",
+    "anthropic>=0.40.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["mcp_telegram"]
+packages = ["xerxes_tg"]
 
 [project.scripts]
-mcp-telegram = "mcp_telegram:app"
-xerxes-tg = "mcp_telegram:app"
+xerxes-tg = "xerxes_tg:app"

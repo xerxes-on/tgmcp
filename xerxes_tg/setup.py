@@ -1,5 +1,5 @@
 # ruff: noqa: T201
-"""Interactive setup wizard for mcp-telegram — with terminal animations."""
+"""Interactive setup wizard for xerxes-tg — with terminal animations."""
 from __future__ import annotations
 
 import asyncio
@@ -20,13 +20,11 @@ from rich.text import Text
 from telethon import TelegramClient  # type: ignore[import-untyped]
 from telethon.errors.rpcerrorlist import SessionPasswordNeededError  # type: ignore[import-untyped]
 from telethon.tl.types import User  # type: ignore[import-untyped]
-from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
-
-from .telegram import CONFIG_DIR, CONFIG_ENV
+from .telegram import CONFIG_DIR, CONFIG_ENV  # noqa: F401 — CONFIG_DIR kept for external importers
 
 console = Console()
 
-_LAUNCH_CMD = f"set -a && . {CONFIG_ENV} && set +a && uvx --from mcp-xerxes-tg xerxes-tg"
+_LAUNCH_CMD = f"set -a && . {CONFIG_ENV} && set +a && uvx --from xerxes-tg xerxes-tg"
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +182,8 @@ class _JsonAgent(_Agent):
             except (json.JSONDecodeError, ValueError):
                 data = {}
         servers = data.setdefault(self.servers_key, {})
-        servers["mcp-telegram"] = self._server_entry()
+        servers.pop("mcp-telegram", None)  # drop legacy key
+        servers["xerxes-tg"] = self._server_entry()
         path.write_text(json.dumps(data, indent=4) + "\n")
 
 
@@ -252,7 +251,8 @@ class Zed(_Agent):
             except (json.JSONDecodeError, ValueError):
                 data = {}
         servers = data.setdefault("context_servers", {})
-        servers["mcp-telegram"] = {
+        servers.pop("mcp-telegram", None)  # drop legacy key
+        servers["xerxes-tg"] = {
             "source": "custom",
             "command": "bash",
             "args": ["-c", _LAUNCH_CMD],
@@ -282,12 +282,19 @@ class CodexCLI(_Agent):
         self._ensure_parent(path)
         lines = path.read_text().splitlines() if path.exists() else []
 
-        # Remove existing mcp-telegram block (header + all following key=value lines until next [header])
+        # Remove existing xerxes-tg / mcp-telegram block (header + all following
+        # key=value lines until next [header])
+        legacy_headers = {
+            '[mcp_servers."mcp-telegram"]',
+            "[mcp_servers.mcp-telegram]",
+            '[mcp_servers."xerxes-tg"]',
+            "[mcp_servers.xerxes-tg]",
+        }
         cleaned: list[str] = []
         skip = False
         for line in lines:
             stripped = line.strip()
-            if stripped in ('[mcp_servers."mcp-telegram"]', "[mcp_servers.mcp-telegram]"):
+            if stripped in legacy_headers:
                 skip = True
                 continue
             if skip:
@@ -303,7 +310,7 @@ class CodexCLI(_Agent):
 
         # Append new block
         cleaned.append("")
-        cleaned.append('[mcp_servers."mcp-telegram"]')
+        cleaned.append('[mcp_servers."xerxes-tg"]')
         cleaned.append('command = "bash"')
         cleaned.append(f'args = ["-c", "{_LAUNCH_CMD}"]')
         cleaned.append("")
@@ -753,50 +760,6 @@ def _parse_ids(raw: str) -> list[int]:
     return [int(x.strip()) for x in raw.split(",") if x.strip()]
 
 
-def _parse_listener_modes(raw: str) -> dict[int, str]:
-    mapping: dict[int, str] = {}
-    if not raw or not raw.strip():
-        return mapping
-    for pair in raw.split(","):
-        item = pair.strip()
-        if not item or "=" not in item:
-            continue
-        cid, _, mode = item.partition("=")
-        cid = cid.strip()
-        mode = mode.strip().lower()
-        if cid.lstrip("-").isdigit() and mode:
-            mapping[int(cid)] = mode
-    return mapping
-
-
-def _parse_bool(raw: str, default: bool = False) -> bool:
-    if not raw:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _select_listener_targets(
-    dialogs: list[tuple[int, str]],
-    previous_ids: set[int],
-) -> list[int]:
-    items = [(name, str(cid)) for cid, name in dialogs]
-    preselected = {i for i, (cid, _) in enumerate(dialogs) if cid in previous_ids}
-    selected, _ = _interactive_select(items, noun="listener chats", preselected=preselected)
-    if -1 in selected:
-        return [cid for cid, _ in dialogs]
-    return [dialogs[i][0] for i in sorted(selected)]
-
-
-def _prompt_listener_mode(name: str, can_write: bool, default: str) -> str:
-    allowed = ["read", "skip"] if not can_write else ["read", "ask", "auto", "decide", "skip"]
-    fallback = default if default in allowed else ("read" if not can_write else "ask")
-    while True:
-        value = _input(f"Mode for {name} ({'/'.join(allowed)})", fallback).strip().lower()
-        if value in allowed:
-            return value
-        console.print(f"  [yellow]Choose one of: {', '.join(allowed)}[/yellow]")
-
-
 # ---------------------------------------------------------------------------
 # Main wizard
 # ---------------------------------------------------------------------------
@@ -826,9 +789,9 @@ async def _run_setup() -> None:  # noqa: C901
     # ── Step 2: Login ────────────────────────────────────────────────────
     _step_header(2, total_steps, "Telegram login")
 
-    state_home = xdg_state_home() / "mcp-telegram"
-    state_home.mkdir(parents=True, exist_ok=True)
-    client = TelegramClient(state_home / "mcp_telegram_session", api_id, api_hash)
+    from . import session as _session
+
+    client = TelegramClient(_session.load_session(), api_id, api_hash)
     await client.connect()
 
     if await client.is_user_authorized():
@@ -854,6 +817,8 @@ async def _run_setup() -> None:  # noqa: C901
         else:
             console.print("  [bright_green]✓[/bright_green] logged in")
 
+    _session.save_session(client)
+
     # ── Step 3: Chat ACL ─────────────────────────────────────────────────
     _step_header(3, total_steps, "Chat access control")
     console.print("  [dim]Choose which chats the MCP server can read/write.[/dim]")
@@ -877,82 +842,46 @@ async def _run_setup() -> None:  # noqa: C901
     all_selected_ids = set(read_ids or []) | set(write_ids or [])
     prev_aliases = _parse_aliases_str(existing.get("TELEGRAM_ALIASES", ""))
 
+    # Start the final alias map from every previously saved alias so that
+    # re-running setup never silently drops aliases for chats the user didn't
+    # re-touch in this pass.
+    aliases: dict[str, int] = dict(prev_aliases)
+
+    # Show what is already saved (dim summary) before prompting.
+    if prev_aliases:
+        console.print()
+        console.print(f"  [bold bright_cyan]Saved aliases[/bold bright_cyan] [dim]({len(prev_aliases)})[/dim]")
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="cyan")
+        summary.add_column(style="dim")
+        for name, cid in prev_aliases.items():
+            summary.add_row(name, str(cid))
+        console.print(summary)
+
     if all_selected_ids:
         console.print()
         console.print("  [bold bright_cyan]Name your chats[/bold bright_cyan] [dim](aliases let agents use names instead of IDs)[/dim]")
-        console.print("  [dim]Press enter to skip, or type a short name for each chat.[/dim]")
+        console.print("  [dim]Press Enter to keep the current alias, or type a new name to rename.[/dim]")
+        console.print("  [dim]Aliases for chats you didn't re-select remain intact.[/dim]")
         console.print()
 
-        aliases: dict[str, int] = {}
         for cid in sorted(all_selected_ids):
             tg_name = next((n for c, n in dialogs if c == cid), str(cid))
             prev_alias = next((a for a, aid in prev_aliases.items() if aid == cid), "")
             alias = _input(f"  {tg_name}", prev_alias)
-            if alias:
-                aliases[alias.lower().replace(" ", "-")] = cid
-        alias_val = ",".join(f"{name}:{cid}" for name, cid in aliases.items())
-    else:
-        alias_val = ""
+            if alias and alias != prev_alias:
+                # Drop any old alias that pointed at the same cid, then any
+                # old alias that reused this name, before inserting the new one.
+                aliases = {a: c for a, c in aliases.items() if c != cid}
+                new_key = alias.lower().replace(" ", "-")
+                aliases.pop(new_key, None)
+                aliases[new_key] = cid
 
-    # ── Step 4: Listener automation ─────────────────────────────────────
-    _step_header(4, total_steps, "Listener automation")
-    console.print("  [dim]Configure optional chat listener and auto-response modes.[/dim]")
-
-    previous_listener_modes = _parse_listener_modes(existing.get("TELEGRAM_LISTENER_CHATS", ""))
-    listener_enabled = _parse_bool(existing.get("TELEGRAM_LISTENER_ENABLED", ""), False)
-    enable_listener = _input("Enable listener? (y/n)", "y" if listener_enabled else "n").lower() == "y"
-
-    listener_map: dict[int, str] = {}
-    listener_approval_chat = existing.get("TELEGRAM_LISTENER_APPROVAL_CHAT", "")
-    listener_agent_cmd = ""
-    listener_system_prompt = existing.get("TELEGRAM_LISTENER_SYSTEM_PROMPT", "")
-    claude_path = existing.get("TELEGRAM_LISTENER_CLAUDE_PATH", "claude")
-
-    if enable_listener:
-        if read_ids is None and write_ids is None:
-            listener_candidates = dialogs
-            writable_ids = {cid for cid, _ in dialogs}
-        else:
-            accessible_ids = set(read_ids or []) | set(write_ids or [])
-            writable_ids = set(write_ids or [])
-            listener_candidates = [(cid, name) for cid, name in dialogs if cid in accessible_ids]
-
-        console.print()
-        console.print("  [bright_cyan]Select listened chats[/bright_cyan]")
-        selected_listener_ids = _select_listener_targets(listener_candidates, set(previous_listener_modes))
-
-        for cid in selected_listener_ids:
-            chat_name = next((name for did, name in listener_candidates if did == cid), str(cid))
-            default_mode = previous_listener_modes.get(cid, "read")
-            chosen_mode = _prompt_listener_mode(chat_name, cid in writable_ids, default_mode)
-            if chosen_mode != "skip":
-                listener_map[cid] = chosen_mode
-
-        if any(mode in {"ask", "decide"} for mode in listener_map.values()):
-            console.print()
-            console.print("  [dim]When a chat is in ask/decide mode, the listener drafts a reply and[/dim]")
-            console.print("  [dim]sends it to YOU for approval before posting. Where should approvals go?[/dim]")
-            console.print("  [dim]Use an alias (e.g. saved-messages, xerxes) or a numeric chat ID.[/dim]")
-            default_approval = listener_approval_chat or "saved-messages"
-            listener_approval_chat = _input("Send approvals to", default_approval)
-
-        if any(mode in {"ask", "auto", "decide"} for mode in listener_map.values()):
-            console.print()
-            console.print("  [dim]The listener uses an external agent CLI for auto-responses.[/dim]")
-            claude_path = existing.get("TELEGRAM_LISTENER_CLAUDE_PATH", "claude")
-            claude_path = _input("Agent CLI path", claude_path)
-            listener_agent_cmd = ""  # retained for compatibility
-            listener_system_prompt = _input("Custom instructions (optional, Enter to use default)", listener_system_prompt)
-    else:
-        listener_map = {}
-        listener_approval_chat = ""
-        listener_agent_cmd = ""
-        listener_system_prompt = ""
+    alias_val = ",".join(f"{name}:{cid}" for name, cid in aliases.items())
 
     # Save config.env
     read_val = ",".join(str(i) for i in read_ids) if read_ids is not None else ""
     write_val = ",".join(str(i) for i in write_ids) if write_ids is not None else ""
-    listener_val = ",".join(f"{cid}={mode}" for cid, mode in sorted(listener_map.items()))
 
     cfg = {
         "TELEGRAM_API_ID": api_id,
@@ -960,11 +889,6 @@ async def _run_setup() -> None:  # noqa: C901
         "TELEGRAM_READ_CHATS": read_val,
         "TELEGRAM_WRITE_CHATS": write_val,
         "TELEGRAM_ALIASES": alias_val,
-        "TELEGRAM_LISTENER_ENABLED": "true" if enable_listener else "false",
-        "TELEGRAM_LISTENER_CHATS": listener_val,
-        "TELEGRAM_LISTENER_APPROVAL_CHAT": listener_approval_chat,
-        "TELEGRAM_LISTENER_CLAUDE_PATH": claude_path,
-        "TELEGRAM_LISTENER_SYSTEM_PROMPT": listener_system_prompt,
     }
     _save_config(cfg)
 
@@ -978,19 +902,11 @@ async def _run_setup() -> None:  # noqa: C901
         r_count = len(read_ids) if read_ids is not None else "all"
         w_count = len(write_ids) if write_ids is not None else "all"
         console.print(f"  [cyan]read:[/cyan] {r_count}  [cyan]write:[/cyan] {w_count}")
+    console.print(f"  [cyan]aliases:[/cyan] {len(aliases)}")
 
-    if enable_listener:
-        console.print(f"  [cyan]listener chats:[/cyan] {len(listener_map)}")
-        modes_summary = ", ".join(f"{m}={sum(1 for v in listener_map.values() if v == m)}" for m in sorted(set(listener_map.values())))
-        console.print(f"  [cyan]modes:[/cyan] {modes_summary}")
-        if any(mode in {'ask', 'decide'} for mode in listener_map.values()):
-            console.print(f"  [cyan]approval chat:[/cyan] {listener_approval_chat}")
-        console.print(f"  [cyan]agent cli:[/cyan] {claude_path}")
-        console.print("  [bright_green]listener auto-starts with the MCP server[/bright_green]")
-
-    # ── Step 5: Select coding agents + scope ────────────────────────────
-    _step_header(5, total_steps, "Coding agent integration")
-    console.print("  [dim]Select which agents should get mcp-telegram access.[/dim]")
+    # ── Step 4: Select coding agents + scope ────────────────────────────
+    _step_header(4, total_steps, "Coding agent integration")
+    console.print("  [dim]Select which agents should get xerxes-tg access.[/dim]")
 
     agents = _select_agents()
 
@@ -1048,8 +964,124 @@ async def _run_setup() -> None:  # noqa: C901
         table.add_row(icon, agent_name, path_str)
     console.print(table)
 
+    # ── Step 5: Autonomous agent ─────────────────────────────────────────
+    _step_agent_setup(dialogs)
+
     # ── Finish ───────────────────────────────────────────────────────────
     _finish_animation()
+
+
+def _step_agent_setup(dialogs: list[tuple[int, str]]) -> None:
+    """Step 5 — configure the autonomous agent."""
+    from .agent.config import AGENT_YAML, AgentConfig
+
+    _step_header(5, 5, "Autonomous agent")
+    console.print("  [dim]Configure which chats the agent monitors and responds to automatically.[/dim]")
+    console.print()
+
+    enable = _input("Enable autonomous agent? (y/n)", "y").lower()
+    if enable != "y":
+        console.print("  [dim]Skipped. Run setup again to enable later.[/dim]")
+        return
+
+    # Load existing agent config for preselection
+    existing_cfg = AgentConfig.load() if AGENT_YAML.exists() else AgentConfig()
+    existing_ids = {c.id for c in existing_cfg.chats}
+
+    # Build items list for the picker
+    items: list[tuple[str, str]] = []
+    for cid, name in dialogs:
+        kind = "group" if cid < 0 else "dm"
+        items.append((name, kind))
+
+    # Preselect chats already in agent.yaml
+    preselected: set[int] = set()
+    for i, (cid, _) in enumerate(dialogs):
+        if cid in existing_ids:
+            preselected.add(i)
+
+    console.print()
+    console.print("  [bold bright_cyan]Which chats should the agent watch?[/bold bright_cyan]")
+    console.print("  [dim]space = toggle    ↑↓ = move    / = search    ⏎ = done[/dim]")
+    console.print()
+
+    selected_indices, _ = _interactive_select(
+        items, "watched chats", preselected=preselected, allow_write=False
+    )
+
+    if not selected_indices or selected_indices == {-1}:
+        console.print()
+        console.print("  [yellow]No chats selected — agent will start but won't respond to anything.[/yellow]")
+        watched_chats: list[tuple[int, str, str]] = []
+    else:
+        watched_chats = []
+        for idx in sorted(selected_indices):
+            cid, name = dialogs[idx]
+            # Auto-guess tone: groups → professional, DMs → friendly
+            default_tone = "professional" if cid < 0 else "friendly"
+            # Check if existing config has a different tone saved
+            for c in existing_cfg.chats:
+                if c.id == cid:
+                    default_tone = c.tone
+                    break
+            tone = _input(f"  Tone for '{name}' (professional/friendly)", default_tone).strip().lower()
+            if tone not in ("professional", "friendly"):
+                tone = default_tone
+            watched_chats.append((cid, "group" if cid < 0 else "dm", tone))
+
+    console.print()
+
+    # Owned services
+    default_services = ",".join(existing_cfg.owned_services) if existing_cfg.owned_services else "ufarm-api,ufarm-market,ufarm-billing,ufarm-auth,ufarm-notifications"
+    raw_services = _input("Owned services (comma-separated keywords)", default_services)
+    owned_services = [s.strip() for s in raw_services.split(",") if s.strip()]
+
+    # Anthropic API key — check env, then config.env, then ask
+    import os
+    from .agent.daemon import _resolve_anthropic_key
+    existing_key = _resolve_anthropic_key()
+    if existing_key:
+        console.print(f"  [bright_green]✓[/bright_green] ANTHROPIC_API_KEY already configured")
+    else:
+        console.print("  [bold bright_cyan]Anthropic API key[/bold bright_cyan]")
+        console.print("  [dim]Get yours at[/dim] https://console.anthropic.com")
+        ak = _input("  ANTHROPIC_API_KEY (leave blank to set later)").strip()
+        if ak:
+            # Append to config.env so it's always available
+            cfg_env_path = CONFIG_DIR / "config.env"
+            cfg_env_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = cfg_env_path.read_text().splitlines() if cfg_env_path.exists() else []
+            lines = [l for l in lines if not l.startswith("ANTHROPIC_API_KEY=")]
+            lines.append(f"ANTHROPIC_API_KEY={ak}")
+            cfg_env_path.write_text("\n".join(lines) + "\n")
+            console.print("  [bright_green]✓[/bright_green] saved to config.env")
+        else:
+            console.print("  [yellow]Skipped — add ANTHROPIC_API_KEY to ~/.config/xerxes-tg/config.env later[/yellow]")
+
+    # Build and save agent.yaml
+    import yaml
+    agent_data = {
+        "confidence_threshold": existing_cfg.confidence_threshold,
+        "debounce_seconds": existing_cfg.debounce_seconds,
+        "approval_ttl_minutes": existing_cfg.approval_ttl_minutes,
+        "owned_services": owned_services,
+        "orchestrator_model": existing_cfg.orchestrator_model,
+        "summarizer_model": existing_cfg.summarizer_model,
+        "max_history_messages": existing_cfg.max_history_messages,
+        "chats": [
+            {"id": cid, "type": kind, "tone": tone}
+            for cid, kind, tone in watched_chats
+        ],
+    }
+    AGENT_YAML.parent.mkdir(parents=True, exist_ok=True)
+    AGENT_YAML.write_text(yaml.safe_dump(agent_data, sort_keys=False, default_flow_style=False))
+
+    console.print()
+    console.print(f"  [bright_green]✓[/bright_green] agent config saved to [dim]{AGENT_YAML}[/dim]")
+    console.print(f"  [cyan]watching:[/cyan] {len(watched_chats)} chat(s)  [cyan]services:[/cyan] {len(owned_services)}")
+    if watched_chats:
+        console.print()
+        console.print("  [dim]Start the agent with:[/dim]  [bold]xerxes-tg agent start[/bold]")
 
 
 def _finish_animation() -> None:
@@ -1075,3 +1107,62 @@ def _finish_animation() -> None:
 
 def run_setup() -> None:
     asyncio.run(_run_setup())
+
+
+def run_install_agents() -> int:
+    """Interactive agent (re)selection — can be run any time post-setup."""
+    console.print()
+    console.print("[bold bright_cyan]xerxes-tg install[/bold bright_cyan]  [dim](coding agent integration)[/dim]")
+    console.print("  [dim]Select which agents should get xerxes-tg access.[/dim]")
+    console.print()
+
+    agents = _select_agents()
+    if not agents:
+        console.print("  [yellow]No agents selected. Nothing changed.[/yellow]")
+        return 0
+
+    console.print()
+    install_global = _input("Install globally? (y/n)", "y").lower() == "y"
+
+    project_dirs: list[Path] = []
+    if not install_global:
+        console.print()
+        console.print("  [bold bright_cyan]Project directories[/bold bright_cyan] [dim](adds project-scoped config)[/dim]")
+        project_dirs = _select_project_dirs()
+
+    console.print()
+    results: list[tuple[str, str, bool]] = []
+    with console.status("  [cyan]writing configs...[/cyan]", spinner="dots"):
+        for agent in agents:
+            if install_global:
+                path = agent.global_path()
+                try:
+                    agent.write_config(path)
+                    results.append((agent.display, str(path), True))
+                except Exception as e:
+                    results.append((agent.display, str(e), False))
+            for proj_dir in project_dirs:
+                path = agent.project_path(proj_dir)
+                try:
+                    agent.write_config(path)
+                    results.append((agent.display, str(path), True))
+                except Exception as e:
+                    results.append((agent.display, str(e), False))
+
+    table = Table(
+        show_header=True,
+        header_style="bold bright_cyan",
+        border_style="dim cyan",
+        padding=(0, 1),
+        show_edge=False,
+    )
+    table.add_column("", width=2)
+    table.add_column("Agent", min_width=20)
+    table.add_column("Path", style="dim")
+    for agent_name, path_str, ok in results:
+        icon = "[bright_green]✓[/bright_green]" if ok else "[red]✗[/red]"
+        table.add_row(icon, agent_name, path_str)
+    console.print(table)
+    console.print()
+    console.print("  [dim]restart your coding agents to pick up changes.[/dim]")
+    return 0 if all(ok for _, _, ok in results) else 1
