@@ -225,19 +225,65 @@ async def run_daemon() -> None:
 
     delivery_task = asyncio.create_task(_delivery_loop(stop_event))
     expiry_task = asyncio.create_task(_expiry_loop(stop_event))
-    client_task = asyncio.create_task(client.run_until_disconnected())
     stop_task = asyncio.create_task(stop_event.wait())
     WATCHER_READY.write_text(str(os.getpid()))
     os.chmod(WATCHER_READY, 0o600)
     logger.info("watcher ready pid=%d", os.getpid())
     try:
-        await asyncio.wait({client_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        reconnect_delay = 1.0
+        while not stop_event.is_set():
+            client_task = asyncio.create_task(client.run_until_disconnected())
+            done, _ = await asyncio.wait(
+                {client_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop_task in done:
+                client_task.cancel()
+                await asyncio.gather(client_task, return_exceptions=True)
+                break
+
+            error = client_task.exception() if not client_task.cancelled() else None
+            if error is not None:
+                logger.warning(
+                    "Telegram listener disconnected (%s: %s); reconnecting",
+                    type(error).__name__,
+                    error,
+                )
+            else:
+                logger.warning("Telegram listener disconnected; reconnecting")
+
+            while not stop_event.is_set():
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        raise RuntimeError(
+                            "Telegram session lost authorization; run xerxes-tg sign-in"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Telegram reconnect failed (%s: %s); retrying in %.0fs",
+                        type(exc).__name__,
+                        exc,
+                        reconnect_delay,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(), timeout=reconnect_delay
+                        )
+                    except TimeoutError:
+                        reconnect_delay = min(60.0, reconnect_delay * 2)
+                        continue
+                else:
+                    logger.info("Telegram listener reconnected")
+                    reconnect_delay = 1.0
+                    break
     finally:
         stop_event.set()
         await client.disconnect()
-        for task in (delivery_task, expiry_task, client_task, stop_task):
+        for task in (delivery_task, expiry_task, stop_task):
             task.cancel()
-        await asyncio.gather(delivery_task, expiry_task, client_task, stop_task, return_exceptions=True)
+        await asyncio.gather(
+            delivery_task, expiry_task, stop_task, return_exceptions=True
+        )
         _remove_pid()
         logger.info("watcher stopped")
 

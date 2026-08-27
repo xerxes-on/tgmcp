@@ -8,6 +8,7 @@ It provides:
 - chat-level read/write access control with aliasing
 - scheduled sends, reply-by-reference, thread view, global search
 - temporary reply watches with signed webhook delivery and polling fallback
+- live reply injection into an open Claude Code session through MCP channels
 - Telegram Mini App WebView URL generation for browser automation
 - a local SQLite + FTS5 mirror with on-demand sync for cross-chat search
 - an on-disk audit log (48h retention) and local rate limiting
@@ -177,12 +178,35 @@ failed payloads are retained for 48 hours; pending poll-only events are kept.
 The state directory, database, log, and signing configuration use owner-only
 permissions because message text is sensitive.
 
-The webhook receiver is the agent boundary: it should enqueue the event, return
-`2xx`, then start or resume its AI run with `watch_id`, `chat_id`, and
-`message_id`. An MCP server cannot assume that an inactive interactive client
-will turn a server notification into a new model turn. The agent can reconstruct
-context with `GetThread` or `ListMessages`, respond with `ReplyTo`, and call
-`StopWatch` when the conversation is finished.
+For clients without live-channel support, the webhook receiver is the agent
+boundary: it should enqueue the event, return `2xx`, then start or resume its AI
+run with `watch_id`, `chat_id`, and `message_id`. Standard MCP notifications do
+not make an inactive interactive client start a model turn. The receiver can
+reconstruct context with `GetThread` or `ListMessages`, respond with `ReplyTo`,
+and call `StopWatch` when the conversation is finished. Claude Code's channel
+extension provides the direct live-session path described below.
+
+### Resume an open Claude Code session
+
+`xerxes-tg` also declares the experimental `claude/channel` MCP capability.
+Start Claude Code with the local development channel enabled:
+
+```bash
+claude --dangerously-load-development-channels server:xerxes-tg
+```
+
+Then use `StartWatch` from that session. Each watch is attached to the MCP
+process that created it. A matching Telegram reply is injected into that open
+session with `chat_id`, `message_id`, sender, watch, event, and sequence
+metadata. Claude Code queues events in order while it is busy. Overlapping
+watches in one session are deduplicated by Telegram chat/message id.
+
+Channel delivery is additive: signed webhooks and `GetWatchEvents` remain
+available as durable fallbacks. Events only inject while that Claude Code
+session is open; for an always-on session, keep Claude Code running in a
+persistent terminal or background process. Custom channels are a research
+preview and the development flag is required until the server is approved or
+packaged on an allowed channel marketplace.
 
 ## Development
 

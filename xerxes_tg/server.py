@@ -8,9 +8,12 @@ from collections.abc import Sequence
 from functools import cache
 
 from mcp.server import Server
+from mcp.shared.message import SessionMessage
 from mcp.types import (
     EmbeddedResource,
     ImageContent,
+    JSONRPCMessage,
+    JSONRPCNotification,
     Prompt,
     Resource,
     ResourceTemplate,
@@ -129,10 +132,33 @@ async def call_tool(name: str, arguments: t.Any) -> Sequence[TextContent | Image
 
 
 async def run_mcp_server() -> None:
+    from . import channel
     from mcp.server.stdio import stdio_server
 
     async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+        async def _send_channel(params: dict[str, t.Any]) -> None:
+            notification = JSONRPCNotification(
+                jsonrpc="2.0",
+                method="notifications/claude/channel",
+                params=params,
+            )
+            await write_stream.send(
+                SessionMessage(message=JSONRPCMessage(root=notification))
+            )
+
+        bridge = channel.ChannelBridge(_send_channel)
+        channel.install(bridge)
+        bridge_task = asyncio.create_task(bridge.run())
+        try:
+            options = app.create_initialization_options(
+                experimental_capabilities={"claude/channel": {}},
+            )
+            await app.run(read_stream, write_stream, options)
+        finally:
+            channel.uninstall(bridge)
+            bridge.stop()
+            bridge_task.cancel()
+            await asyncio.gather(bridge_task, return_exceptions=True)
 
 
 def main() -> None:

@@ -1467,7 +1467,7 @@ class StartWatch(ToolArgs):
 async def start_watch_tool(
     args: StartWatch,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import watch_store, watcher
+    from . import channel, watch_store, watcher
     from .webhook import WebhookConfig
 
     did = resolve_dialog_id(args.dialog_id)
@@ -1496,11 +1496,19 @@ async def start_watch_tool(
         await watch_store.stop_watch(watch["watch_id"], reason="watcher_start_failed")
         raise
 
+    channel_registered = channel.register_watch(watch["watch_id"])
     config = WebhookConfig.load()
     result = {
         **watch,
         "watcher_pid": pid,
         "webhook_configured": config.enabled,
+        "live_session_channel": {
+            "registered": channel_registered,
+            "client_support": "Claude Code channels",
+            "launch_flag": (
+                "--dangerously-load-development-channels server:xerxes-tg"
+            ),
+        },
         "polling_fallback": {
             "tool": "GetWatchEvents",
             "watch_id": watch["watch_id"],
@@ -1509,8 +1517,9 @@ async def start_watch_tool(
     }
     if not config.enabled:
         result["warning"] = (
-            "Webhook delivery is disabled until XERXES_TG_WEBHOOK_URL and "
-            "XERXES_TG_WEBHOOK_SECRET are configured; events remain pollable."
+            "Webhook delivery is disabled. Live Claude Code channel delivery "
+            "still works when the session was launched with the reported flag; "
+            "events also remain pollable."
         )
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
@@ -1525,11 +1534,12 @@ class StopWatch(ToolArgs):
 async def stop_watch_tool(
     args: StopWatch,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import watch_store
+    from . import channel, watch_store
 
     watch = await watch_store.stop_watch(args.watch_id)
     if watch is None:
         raise ValueError(f"Unknown watch_id: {args.watch_id}")
+    channel.unregister_watch(args.watch_id)
     return [TextContent(type="text", text=json.dumps(watch, ensure_ascii=False))]
 
 
@@ -1543,7 +1553,7 @@ class ListWatches(ToolArgs):
 async def list_watches_tool(
     args: ListWatches,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import watch_store, watcher
+    from . import channel, watch_store, watcher
     from .webhook import WebhookConfig
 
     watches = await watch_store.list_watches(include_inactive=args.include_inactive)
@@ -1551,6 +1561,7 @@ async def list_watches_tool(
         "watcher_running": watcher.is_running(),
         "watcher_ready": watcher.is_ready(),
         "webhook_configured": WebhookConfig.load().enabled,
+        "live_session_watch_ids": list(channel.registered_watch_ids()),
         "watches": watches,
     }
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
