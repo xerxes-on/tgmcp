@@ -154,6 +154,52 @@ class WatchStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stopped)
         self.assertEqual(stopped["status"], "stopped")
 
+    async def test_codex_bound_watch_enqueues_and_tracks_delivery(self) -> None:
+        watch = await watch_store.start_watch(
+            dialog_id=42,
+            codex_thread_id="thread-123",
+            idle_timeout_seconds=60,
+            max_duration_seconds=120,
+            now=100,
+            db_path=self.db_path,
+        )
+        self.assertEqual(watch["codex_thread_id"], "thread-123")
+
+        events = await watch_store.record_incoming(
+            dialog_id=42,
+            message_id=11,
+            reply_to_message_id=None,
+            sender_id=7,
+            sender_name="User",
+            text="hello Codex",
+            received_at=101,
+            db_path=self.db_path,
+        )
+        self.assertEqual(len(events), 1)
+
+        due = await watch_store.due_codex_deliveries(now=101, db_path=self.db_path)
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0]["thread_id"], "thread-123")
+        self.assertEqual(due[0]["payload"]["text"], "hello Codex")
+
+        polled = await watch_store.get_events(watch["watch_id"], db_path=self.db_path)
+        self.assertEqual(polled[0]["codex_delivery"]["status"], "pending")
+
+        await watch_store.mark_codex_delivered(
+            [events[0]["sequence"]],
+            method="steered",
+            now=102,
+            db_path=self.db_path,
+        )
+        self.assertEqual(
+            await watch_store.due_codex_deliveries(now=102, db_path=self.db_path), []
+        )
+        delivered = await watch_store.get_events(
+            watch["watch_id"], db_path=self.db_path
+        )
+        self.assertEqual(delivered[0]["codex_delivery"]["status"], "delivered")
+        self.assertEqual(delivered[0]["codex_delivery"]["method"], "steered")
+
     async def test_prune_removes_only_old_terminal_state(self) -> None:
         delivered_watch = await watch_store.start_watch(
             dialog_id=1,

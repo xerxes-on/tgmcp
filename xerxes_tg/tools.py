@@ -1452,12 +1452,17 @@ class StartWatch(ToolArgs):
     always stops at ``max_duration_seconds``. Use ``mode='once'`` to stop after
     the first match, or ``mode='conversation'`` to renew the idle deadline on
     every match. Webhook destinations and secrets come only from local config.
+
+    In Codex, bind the watch to the originating chat by passing that chat's
+    ``CODEX_THREAD_ID`` as ``codex_thread_id``. The server also auto-detects
+    that environment value when the MCP process inherits it.
     """
 
     dialog_id: int | str
     after_message_id: int | None = None
     reply_to_message_id: int | None = None
     sender_id: int | None = None
+    codex_thread_id: str | None = None
     mode: t.Literal["once", "conversation"] = "conversation"
     idle_timeout_seconds: int = 3600
     max_duration_seconds: int = 86400
@@ -1467,7 +1472,7 @@ class StartWatch(ToolArgs):
 async def start_watch_tool(
     args: StartWatch,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import channel, watch_store, watcher
+    from . import channel, codex_delivery, watch_store, watcher
     from .webhook import WebhookConfig
 
     did = resolve_dialog_id(args.dialog_id)
@@ -1481,11 +1486,13 @@ async def start_watch_tool(
     if args.max_duration_seconds < args.idle_timeout_seconds:
         raise ValueError("max_duration_seconds must be at least idle_timeout_seconds")
 
+    codex_thread_id = codex_delivery.current_thread_id(args.codex_thread_id)
     watch = await watch_store.start_watch(
         dialog_id=did,
         after_message_id=args.after_message_id,
         reply_to_message_id=args.reply_to_message_id,
         sender_id=args.sender_id,
+        codex_thread_id=codex_thread_id,
         mode=args.mode,
         idle_timeout_seconds=args.idle_timeout_seconds,
         max_duration_seconds=args.max_duration_seconds,
@@ -1502,6 +1509,15 @@ async def start_watch_tool(
         **watch,
         "watcher_pid": pid,
         "webhook_configured": config.enabled,
+        "codex_chat_delivery": {
+            "configured": codex_thread_id is not None,
+            "thread_id": codex_thread_id,
+            "live_mid_turn": (
+                "available when this Codex chat uses the shared app server "
+                "(codex --remote unix://)"
+            ),
+            "fallback": "durable codex queue for direct CLI chats",
+        },
         "live_session_channel": {
             "registered": channel_registered,
             "client_support": "Claude Code channels",
@@ -1520,6 +1536,12 @@ async def start_watch_tool(
             "Webhook delivery is disabled. Live Claude Code channel delivery "
             "still works when the session was launched with the reported flag; "
             "events also remain pollable."
+        )
+    if codex_thread_id is None:
+        result["codex_warning"] = (
+            "This watch is not bound to a Codex chat. In Codex, pass the current "
+            "CODEX_THREAD_ID as codex_thread_id so matching Telegram messages "
+            "return to this chat."
         )
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
@@ -1553,7 +1575,7 @@ class ListWatches(ToolArgs):
 async def list_watches_tool(
     args: ListWatches,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import channel, watch_store, watcher
+    from . import channel, codex_delivery, watch_store, watcher
     from .webhook import WebhookConfig
 
     watches = await watch_store.list_watches(include_inactive=args.include_inactive)
@@ -1562,6 +1584,7 @@ async def list_watches_tool(
         "watcher_ready": watcher.is_ready(),
         "webhook_configured": WebhookConfig.load().enabled,
         "live_session_watch_ids": list(channel.registered_watch_ids()),
+        "codex_thread_auto_detected": codex_delivery.current_thread_id() is not None,
         "watches": watches,
     }
     return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]

@@ -10,12 +10,15 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from telethon import events  # type: ignore[import-untyped]
+from telethon import TelegramClient, custom, errors, events  # type: ignore[import-untyped]
 from xdg_base_dirs import xdg_state_home  # type: ignore[import-error]
 
 from . import watch_store
-from .telegram import create_client
+from .codex_delivery import deliver_due_once as deliver_codex_due_once
+from .telegram import check_access, create_client
 from .webhook import WebhookConfig, deliver_due_once
 
 logger = logging.getLogger(__name__)
@@ -24,6 +27,79 @@ STATE_DIR = xdg_state_home() / "xerxes-tg"
 WATCHER_PID = STATE_DIR / "watcher.pid"
 WATCHER_LOG = STATE_DIR / "watcher.log"
 WATCHER_READY = STATE_DIR / "watcher.ready"
+RECONCILE_SECONDS = 10.0
+
+
+async def _record_message(
+    dialog_id: int, message: custom.Message, *, db_path: Path = watch_store.WATCH_DB,
+) -> None:
+    if getattr(message, "out", False):
+        return
+    sender = await message.get_sender()
+    first = getattr(sender, "first_name", "") or ""
+    last = getattr(sender, "last_name", "") or ""
+    username = getattr(sender, "username", "") or ""
+    sender_id = message.sender_id
+    sender_name = f"{first} {last}".strip() or username or str(sender_id or "Unknown")
+    matched = await watch_store.record_incoming(
+        dialog_id=dialog_id,
+        message_id=message.id,
+        reply_to_message_id=message.reply_to_msg_id,
+        sender_id=sender_id,
+        sender_name=sender_name,
+        text=message.text or message.message or "",
+        sent_at=int(message.date.timestamp()),
+        db_path=db_path,
+    )
+    if matched:
+        logger.info("matched message chat=%s message=%s watches=%d", dialog_id, message.id, len(matched))
+
+
+async def _reconcile_once(
+    client: TelegramClient, cursors: dict[int, int], *, db_path: Path = watch_store.WATCH_DB,
+) -> None:
+    watches = await watch_store.list_watches(db_path=db_path)
+    starts: dict[int, datetime] = {}
+    for watch in watches:
+        dialog_id = watch["dialog_id"]
+        start = datetime.fromisoformat(watch["created_at"])
+        starts[dialog_id] = min(starts.get(dialog_id, start), start)
+    for dialog_id in set(cursors) - starts.keys():
+        del cursors[dialog_id]
+    for dialog_id, start in starts.items():
+        try:
+            check_access(dialog_id, "read")
+            async for message in client.iter_messages(
+                dialog_id,
+                limit=100,
+                reverse=True,
+                min_id=cursors.get(dialog_id, 0),
+                offset_date=start - timedelta(seconds=1) if not cursors.get(dialog_id) else None,
+            ):
+                if message.date and message.date >= start:
+                    await _record_message(dialog_id, message, db_path=db_path)
+                cursors[dialog_id] = message.id
+        except errors.FloodWaitError:
+            raise
+        except (OSError, RuntimeError, ValueError, sqlite3.Error, errors.RPCError):
+            logger.exception("history reconciliation failed for chat=%s", dialog_id)
+
+
+async def _reconcile_loop(client: TelegramClient, stop_event: asyncio.Event) -> None:
+    cursors: dict[int, int] = {}
+    while not stop_event.is_set():
+        delay = RECONCILE_SECONDS
+        try:
+            await _reconcile_once(client, cursors)
+        except errors.FloodWaitError as exc:
+            delay = max(delay, float(exc.seconds))
+            logger.warning("history reconciliation rate-limited; waiting %.0fs", delay)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            logger.exception("history reconciliation failed; will retry")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
 
 
 def read_pid() -> int | None:
@@ -173,11 +249,27 @@ async def _expiry_loop(stop_event: asyncio.Event) -> None:
             pass
 
 
+async def _codex_delivery_loop(stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            delivered, failed = await deliver_codex_due_once()
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            logger.exception("Codex chat delivery batch failed; will retry")
+            delivered, failed = 0, 0
+        if delivered or failed:
+            logger.info("Codex chat batch delivered=%d failed=%d", delivered, failed)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+        except TimeoutError:
+            pass
+
+
 async def run_daemon() -> None:
     if is_running():
         raise RuntimeError(f"watcher is already running (PID {read_pid()})")
     _write_pid()
     client = create_client()
+    client.flood_sleep_threshold = 0
     try:
         await watch_store.init()
         await client.connect()
@@ -192,28 +284,7 @@ async def run_daemon() -> None:
     async def _on_message(event: events.NewMessage.Event) -> None:
         if getattr(event, "out", False) or event.message is None or event.chat_id is None:
             return
-        message = event.message
-        sender = await event.get_sender()
-        first = getattr(sender, "first_name", "") or ""
-        last = getattr(sender, "last_name", "") or ""
-        username = getattr(sender, "username", "") or ""
-        sender_name = f"{first} {last}".strip() or username or str(getattr(sender, "id", "Unknown"))
-        matched = await watch_store.record_incoming(
-            dialog_id=int(event.chat_id),
-            message_id=message.id,
-            reply_to_message_id=message.reply_to_msg_id,
-            sender_id=getattr(sender, "id", None),
-            sender_name=sender_name,
-            text=message.text or message.message or "",
-            received_at=int(time.time()),
-        )
-        if matched:
-            logger.info(
-                "matched message chat=%s message=%s watches=%d",
-                event.chat_id,
-                message.id,
-                len(matched),
-            )
+        await _record_message(int(event.chat_id), event.message)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -224,7 +295,9 @@ async def run_daemon() -> None:
             signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop_event.set))
 
     delivery_task = asyncio.create_task(_delivery_loop(stop_event))
+    codex_delivery_task = asyncio.create_task(_codex_delivery_loop(stop_event))
     expiry_task = asyncio.create_task(_expiry_loop(stop_event))
+    reconcile_task = asyncio.create_task(_reconcile_loop(client, stop_event))
     stop_task = asyncio.create_task(stop_event.wait())
     WATCHER_READY.write_text(str(os.getpid()))
     os.chmod(WATCHER_READY, 0o600)
@@ -244,9 +317,8 @@ async def run_daemon() -> None:
             error = client_task.exception() if not client_task.cancelled() else None
             if error is not None:
                 logger.warning(
-                    "Telegram listener disconnected (%s: %s); reconnecting",
+                    "Telegram listener disconnected (%s); reconnecting",
                     type(error).__name__,
-                    error,
                 )
             else:
                 logger.warning("Telegram listener disconnected; reconnecting")
@@ -279,10 +351,15 @@ async def run_daemon() -> None:
     finally:
         stop_event.set()
         await client.disconnect()
-        for task in (delivery_task, expiry_task, stop_task):
+        for task in (delivery_task, codex_delivery_task, expiry_task, reconcile_task, stop_task):
             task.cancel()
         await asyncio.gather(
-            delivery_task, expiry_task, stop_task, return_exceptions=True
+            delivery_task,
+            codex_delivery_task,
+            expiry_task,
+            reconcile_task,
+            stop_task,
+            return_exceptions=True,
         )
         _remove_pid()
         logger.info("watcher stopped")

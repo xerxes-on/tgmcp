@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import watch_store
+from .watch_notice import event_notice
 
 logger = logging.getLogger(__name__)
 
@@ -153,23 +154,14 @@ def registered_watch_ids() -> tuple[str, ...]:
 
 def _notification_params(event: dict[str, Any]) -> dict[str, Any]:
     sender = event.get("sender") or {}
-    sender_name = str(sender.get("name") or sender.get("id") or "Unknown")
-    text = str(event.get("text") or "")
-    content = (
-        "Telegram event:\n"
-        f"{sender_name} replied: {text!r}\n"
-        "Decide whether any action is needed. Use the xerxes-tg tools if a "
-        "Telegram reply or more context is needed."
-    )
     return {
-        "content": content,
+        "content": event_notice(event),
         "meta": {
             "event_id": str(event["event_id"]),
             "watch_id": str(event["watch_id"]),
             "chat_id": str(event["chat_id"]),
             "message_id": str(event["message_id"]),
             "sender_id": str(sender.get("id") or ""),
-            "sender_name": sender_name,
             "sequence": str(event["sequence"]),
         },
     }

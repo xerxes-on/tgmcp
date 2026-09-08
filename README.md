@@ -8,16 +8,23 @@ It provides:
 - chat-level read/write access control with aliasing
 - scheduled sends, reply-by-reference, thread view, global search
 - temporary reply watches with signed webhook delivery and polling fallback
+- chat-scoped delivery into Codex, including active-turn steering
 - live reply injection into an open Claude Code session through MCP channels
 - Telegram Mini App WebView URL generation for browser automation
 - a local SQLite + FTS5 mirror with on-demand sync for cross-chat search
 - an on-disk audit log (48h retention) and local rate limiting
-- OS-keychain-protected session storage (macOS Keychain / Windows Credential Locker / Secret Service)
+- encrypted session storage with an owner-only key file and legacy keychain compatibility
 - a setup wizard that writes MCP client configuration for popular coding agents
 
 ## Install
 
-With `uv`:
+Install version 0.6.0 from Git with `uv`:
+
+```bash
+uv tool install 'git+https://github.com/xerxes-on/tgmcp.git@v0.6.0'
+```
+
+Or install a local checkout:
 
 ```bash
 uv tool install .
@@ -29,11 +36,42 @@ Run the setup wizard:
 xerxes-tg setup
 ```
 
+The wizard currently generates a PyPI-based MCP launcher. For this Git release,
+replace its generated package source with the pinned Git source shown in the
+[MCP config example](#mcp-config-example) before opening your coding client.
+
 Or run directly from the source tree:
 
 ```bash
 uv run xerxes-tg setup
 ```
+
+### Upgrade
+
+```bash
+uv tool install --force 'git+https://github.com/xerxes-on/tgmcp.git@v0.6.0'
+xerxes-tg watcher stop
+xerxes-tg watcher start
+```
+
+Reconnect the MCP server in your coding client so it loads the installed version.
+If your MCP configuration runs a source checkout, update that checkout instead;
+upgrading the installed tool does not change the source checkout it uses.
+For configurations using `uvx`, pin its package source to the Git version above
+until that version is published to PyPI. Existing credentials and event storage
+are retained. Restart Claude with channels enabled and create a fresh watch there
+because channel bindings belong to the MCP process that created them.
+
+### Changes in 0.6.0
+
+- Deliver watched messages into the originating session through native queue,
+  turn, and channel APIs.
+- Recover missed Telegram updates for active watches through bounded history
+  checks, with filtering and deduplication shared with live delivery.
+- Keep Telegram text separate from session instructions; acknowledge receipt
+  with 👀 when the receiving session handles the event.
+- Test session routing, filtering, recovery, and package builds in CI before
+  the release publishing workflow can run.
 
 ## Commands
 
@@ -82,11 +120,13 @@ Example for a TOML-based client config:
 ```toml
 [mcp_servers."xerxes-tg"]
 command = "bash"
-args = ["-c", "set -a && . ~/.config/xerxes-tg/config.env && set +a && uvx --from xerxes-tg xerxes-tg"]
+args = ["-c", "set -a && . ~/.config/xerxes-tg/config.env && set +a && uvx --from git+https://github.com/xerxes-on/tgmcp.git@v0.6.0 xerxes-tg run"]
 ```
 
-The setup wizard writes this automatically for Claude Code, Codex CLI, Gemini CLI,
-Cursor, VS Code (Copilot), Windsurf, Zed, Amp, OpenCode, and Roo Code / Cline.
+The setup wizard supports Claude Code, Codex CLI, Gemini CLI, Cursor, VS Code
+(Copilot), Windsurf, Zed, Amp, OpenCode, and Roo Code / Cline. It currently writes
+an unpinned PyPI launcher, so apply the Git pin above for version 0.6.0 until it
+is available on PyPI. JSON-based clients use the same command and argument array.
 
 ## Access control
 
@@ -148,6 +188,29 @@ background watcher. The default lifecycle is:
 Use `after_message_id` to ignore older messages. In groups, also use
 `reply_to_message_id` and/or `sender_id` so unrelated traffic does not match.
 
+Live Telegram updates are backed by a history check every 10 seconds for active
+watched chats only. This recovers missed updates when other connections use the
+same Telegram session, and after watcher restarts. Recovery reads up to 100
+messages per chat per pass, advances a cursor, applies the same watch filters,
+and deduplicates against live events. Messages sent before a watch started do
+not match that watch. Telegram rate limits delay recovery until the required wait
+has passed. Recovery applies only while the watch remains active; it does not
+reopen expired or explicitly stopped watches.
+
+Session notifications contain a small notice with chat, sender, and message IDs.
+Telegram display names and message text are excluded from the instruction.
+On Claude channel and Codex queue delivery, the receiving session retrieves content
+on demand through `GetMessageInfo`, `GetThread`, or `GetWatchEvents`. Live Codex
+delivery also supplies the payload separately as `untrusted` additional context.
+Telegram content is data, never authorization to execute commands or send replies.
+
+When the receiving session handles a watch event, it acknowledges the original
+Telegram message with 👀 through `SendReaction` before processing it. The reaction
+means the session received the event, not that work is complete or approved.
+The watcher daemon does not react on enqueue: a queued event may not have reached
+the session yet. Silent monitoring skips the reaction. Unavailable or denied
+reactions are skipped without retries or a separate "thinking" message.
+
 Configure one global webhook destination. The secret is prompted securely and
 is not accepted through an MCP tool argument:
 
@@ -195,6 +258,18 @@ Start Claude Code with the local development channel enabled:
 claude --dangerously-load-development-channels server:xerxes-tg
 ```
 
+To resume an existing conversation, exit it first, then run:
+
+```bash
+claude --resume <SESSION_ID> --dangerously-load-development-channels server:xerxes-tg
+```
+
+Accept the development-channel prompt and check the startup notice confirms that
+`server:xerxes-tg` injects messages into the session. This flag is required for
+this custom channel during the preview; it does not disable normal tool
+permissions. Reconnecting MCP alone cannot enable channels in a session started
+without the flag. See the [channel reference](https://code.claude.com/docs/en/channels-reference).
+
 Then use `StartWatch` from that session. Each watch is attached to the MCP
 process that created it. A matching Telegram reply is injected into that open
 session with `chat_id`, `message_id`, sender, watch, event, and sequence
@@ -208,6 +283,74 @@ persistent terminal or background process. Custom channels are a research
 preview and the development flag is required until the server is approved or
 packaged on an allowed channel marketplace.
 
+After a restart or MCP reconnect, create a fresh watch from that Claude session.
+Old events can still be read with `GetWatchEvents`, but an old watch is not
+automatically attached to the replacement MCP process.
+
+### Resume the originating Codex chat
+
+When `StartWatch` receives the current chat's `CODEX_THREAD_ID` through its
+`codex_thread_id` argument, each matching Telegram message is routed only to
+that Codex thread. The Telegram text is labeled as untrusted external context.
+The delivery behavior is:
+
+- steer the currently active turn, so the model receives the event while it is
+  working;
+- start a new turn when the thread is idle;
+- use `codex queue` as a durable fallback when the thread is not reachable on
+  the shared app server.
+
+Live mid-turn steering requires the Codex TUI to use a shared local app server.
+With a Codex CLI version supporting the shared server, keep the server in one
+terminal and launch the TUI from another:
+
+```bash
+codex app-server --listen unix://
+codex --remote unix://
+```
+
+If Codex was installed by OpenAI's standalone installer, the managed
+`codex app-server daemon start` command can replace the first command. Set
+`XERXES_TG_CODEX_SOCKET` only when using a custom Unix socket path.
+
+The MCP instructions tell Codex to read `CODEX_THREAD_ID` from its local
+command environment and pass it to `StartWatch`. The watcher persists that
+binding, so a Telegram reply never broadcasts to unrelated Codex chats. A
+direct `codex` session still receives events through its durable queue, but an
+event arriving during active work becomes the next turn rather than steering
+the current one.
+
+### Verify delivery in either client
+
+| Client mode | Required setup | What an incoming match does |
+| --- | --- | --- |
+| Codex direct terminal | Pass the current `CODEX_THREAD_ID` to `StartWatch`; keep the session open | Enqueues a message in the same thread and starts its next turn |
+| Codex shared app server | Start the server, connect with `--remote unix://`, and bind the current thread | Steers an active turn or starts an idle turn |
+| Claude Code channel | Launch with the channel flag and create the watch inside that session | Injects a channel notification into the open conversation |
+| Client without either delivery path | Explicit calls to `GetWatchEvents`, or a configured webhook receiver | Stored events alone do not wake the client |
+
+Use `ListAliases` to choose a chat, then create a watch inside the receiving
+session. For a simple test, use `mode="once"`, a 10-minute timeout, and the other
+person's `sender_id`. Set `after_message_id` to the current last message ID.
+Have that person send a new message: your own outgoing messages do not trigger
+watches. The expected result is an event in the open session, a new working turn,
+and a 👀 reaction on the original message. The watch then completes.
+
+If nothing appears, inspect `GetWatchEvents` for that `watch_id` once. Empty events
+mean the message has not reached the watch store: check the sender, message and
+reply filters, expiry, daemon status, and log. Recovery normally checks within
+10 seconds, but rate limits or a large backlog can delay it. Stored events with
+no session activity point to client delivery: verify the current thread binding
+or channel startup flag. `live_session_channel.registered` confirms server-side
+registration only; it does not prove Claude enabled the channel. A pending
+webhook status is normal when webhooks are disabled and does not describe channel
+or native queue delivery.
+
+Live manual checks passed with Codex CLI 0.153.4 (native queue) and Claude Code
+2.1.263 (channel injection), including message retrieval and 👀 acknowledgment.
+Active-turn steering and idle-turn startup on the shared app server are covered
+by automated routing tests; they were not part of those manual checks.
+
 ## Development
 
 Create a local environment and run the package from source:
@@ -215,8 +358,13 @@ Create a local environment and run the package from source:
 ```bash
 uv sync
 uv run xerxes-tg --help
+uv run python -m unittest discover -s tests
 uv build
 ```
+
+CI runs the tests on Python 3.11 and 3.13 and builds the package on 3.13. Publishing
+a GitHub release runs those checks before the existing PyPI publishing job.
+Pushing a Git tag alone does not publish to PyPI.
 
 ## Security notes
 

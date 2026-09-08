@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS watches (
     last_activity_at      INTEGER NOT NULL,
     expires_at            INTEGER NOT NULL,
     hard_expires_at       INTEGER NOT NULL,
+    codex_thread_id       TEXT,
     status                TEXT NOT NULL DEFAULT 'active',
     stop_reason           TEXT,
     stopped_at            INTEGER
@@ -62,6 +63,20 @@ CREATE INDEX IF NOT EXISTS idx_watch_events_delivery
     ON watch_events(delivery_status, next_attempt_at, sequence);
 CREATE INDEX IF NOT EXISTS idx_watch_events_watch
     ON watch_events(watch_id, sequence);
+
+CREATE TABLE IF NOT EXISTS codex_deliveries (
+    sequence          INTEGER PRIMARY KEY,
+    thread_id         TEXT NOT NULL,
+    delivery_status   TEXT NOT NULL DEFAULT 'pending',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at   INTEGER NOT NULL,
+    delivered_at      INTEGER,
+    delivery_method   TEXT,
+    last_error        TEXT,
+    FOREIGN KEY (sequence) REFERENCES watch_events(sequence) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_codex_deliveries_due
+    ON codex_deliveries(delivery_status, next_attempt_at, sequence);
 """
 
 
@@ -80,6 +95,10 @@ async def _connect(db_path: Path = WATCH_DB) -> aiosqlite.Connection:
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
     await db.executescript(_SCHEMA)
+    async with db.execute("PRAGMA table_info(watches)") as cursor:
+        watch_columns = {row[1] for row in await cursor.fetchall()}
+    if "codex_thread_id" not in watch_columns:
+        await db.execute("ALTER TABLE watches ADD COLUMN codex_thread_id TEXT")
     await db.commit()
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{db_path}{suffix}")
@@ -103,6 +122,7 @@ def _watch_dict(row: aiosqlite.Row) -> dict[str, Any]:
         "mode": row["mode"],
         "idle_timeout_seconds": row["idle_timeout_seconds"],
         "max_duration_seconds": row["max_duration_seconds"],
+        "codex_thread_id": row["codex_thread_id"],
         "status": row["status"],
         "stop_reason": row["stop_reason"],
         "created_at": _iso(row["created_at"]),
@@ -140,6 +160,7 @@ async def start_watch(
     after_message_id: int | None = None,
     reply_to_message_id: int | None = None,
     sender_id: int | None = None,
+    codex_thread_id: str | None = None,
     mode: WatchMode = "conversation",
     idle_timeout_seconds: int = 3600,
     max_duration_seconds: int = 86400,
@@ -152,6 +173,10 @@ async def start_watch(
         raise ValueError("idle_timeout_seconds must be at least 30")
     if max_duration_seconds < idle_timeout_seconds:
         raise ValueError("max_duration_seconds must be greater than or equal to idle_timeout_seconds")
+    if codex_thread_id is not None:
+        codex_thread_id = codex_thread_id.strip()
+        if not codex_thread_id:
+            raise ValueError("codex_thread_id cannot be empty")
 
     current = now if now is not None else int(time.time())
     hard_expires_at = current + max_duration_seconds
@@ -163,8 +188,9 @@ async def start_watch(
             """INSERT INTO watches(
                    watch_id, dialog_id, after_message_id, reply_to_message_id,
                    sender_id, mode, idle_timeout_seconds, max_duration_seconds,
-                   created_at, last_activity_at, expires_at, hard_expires_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   created_at, last_activity_at, expires_at, hard_expires_at,
+                   codex_thread_id
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 watch_id,
                 dialog_id,
@@ -178,6 +204,7 @@ async def start_watch(
                 current,
                 expires_at,
                 hard_expires_at,
+                codex_thread_id,
             ),
         )
         await db.commit()
@@ -242,6 +269,7 @@ async def record_incoming(
     sender_name: str,
     text: str,
     received_at: int | None = None,
+    sent_at: int | None = None,
     db_path: Path = WATCH_DB,
 ) -> list[dict[str, Any]]:
     """Match an incoming Telegram message and atomically enqueue watch events."""
@@ -267,6 +295,7 @@ async def record_incoming(
                  AND dialog_id=?
                  AND expires_at > ?
                  AND hard_expires_at > ?
+                 AND created_at <= ?
                  AND (after_message_id IS NULL OR ? > after_message_id)
                  AND (reply_to_message_id IS NULL OR reply_to_message_id=?)
                  AND (sender_id IS NULL OR sender_id=?)
@@ -275,6 +304,7 @@ async def record_incoming(
                 dialog_id,
                 current,
                 current,
+                sent_at if sent_at is not None else current,
                 message_id,
                 reply_to_message_id,
                 sender_id,
@@ -325,6 +355,13 @@ async def record_incoming(
                 "UPDATE watch_events SET payload_json=? WHERE sequence=?",
                 (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), sequence),
             )
+            if watch["codex_thread_id"]:
+                await db.execute(
+                    """INSERT INTO codex_deliveries(
+                           sequence, thread_id, next_attempt_at
+                       ) VALUES(?,?,?)""",
+                    (sequence, watch["codex_thread_id"], current),
+                )
             events.append(payload)
 
             if watch["mode"] == "once":
@@ -363,11 +400,18 @@ async def get_events(
     db = await _connect(db_path)
     try:
         async with db.execute(
-            """SELECT sequence, payload_json, delivery_status, delivery_attempts,
-                      delivered_at, last_error
-               FROM watch_events
-               WHERE watch_id=? AND sequence>?
-               ORDER BY sequence ASC LIMIT ?""",
+            """SELECT e.sequence, e.payload_json, e.delivery_status,
+                      e.delivery_attempts, e.delivered_at, e.last_error,
+                      c.thread_id AS codex_thread_id,
+                      c.delivery_status AS codex_delivery_status,
+                      c.delivery_attempts AS codex_delivery_attempts,
+                      c.delivered_at AS codex_delivered_at,
+                      c.delivery_method AS codex_delivery_method,
+                      c.last_error AS codex_last_error
+               FROM watch_events e
+               LEFT JOIN codex_deliveries c ON c.sequence=e.sequence
+               WHERE e.watch_id=? AND e.sequence>?
+               ORDER BY e.sequence ASC LIMIT ?""",
             (watch_id, after_sequence, limit),
         ) as cursor:
             rows = await cursor.fetchall()
@@ -380,6 +424,15 @@ async def get_events(
                 "delivered_at": _iso(row["delivered_at"]),
                 "last_error": row["last_error"],
             }
+            if row["codex_thread_id"]:
+                payload["codex_delivery"] = {
+                    "thread_id": row["codex_thread_id"],
+                    "status": row["codex_delivery_status"],
+                    "attempts": row["codex_delivery_attempts"],
+                    "delivered_at": _iso(row["codex_delivered_at"]),
+                    "method": row["codex_delivery_method"],
+                    "last_error": row["codex_last_error"],
+                }
             result.append(payload)
         return result
     finally:
@@ -469,6 +522,114 @@ async def mark_delivery_failed(
         await db.close()
 
 
+async def due_codex_deliveries(
+    *,
+    now: int | None = None,
+    limit: int = 20,
+    db_path: Path = WATCH_DB,
+) -> list[dict[str, Any]]:
+    current = now if now is not None else int(time.time())
+    db = await _connect(db_path)
+    try:
+        async with db.execute(
+            """WITH due_messages AS (
+                   SELECT c.thread_id, e.dialog_id, e.message_id
+                   FROM codex_deliveries c
+                   JOIN watch_events e ON e.sequence=c.sequence
+                   WHERE c.delivery_status IN ('pending', 'retry')
+                     AND c.next_attempt_at<=?
+                   GROUP BY c.thread_id, e.dialog_id, e.message_id
+                   ORDER BY MIN(c.sequence) LIMIT ?
+               )
+               SELECT c.sequence, c.thread_id, c.delivery_attempts,
+                      e.event_id, e.dialog_id, e.message_id, e.payload_json
+               FROM codex_deliveries c
+               JOIN watch_events e ON e.sequence=c.sequence
+               JOIN due_messages d ON d.thread_id=c.thread_id
+                   AND d.dialog_id=e.dialog_id AND d.message_id=e.message_id
+               WHERE c.delivery_status IN ('pending', 'retry')
+               ORDER BY c.sequence ASC""",
+            (current, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            {
+                "sequence": row["sequence"],
+                "thread_id": row["thread_id"],
+                "event_id": row["event_id"],
+                "dialog_id": row["dialog_id"],
+                "message_id": row["message_id"],
+                "payload": json.loads(row["payload_json"]),
+                "attempts": row["delivery_attempts"],
+            }
+            for row in rows
+        ]
+    finally:
+        await db.close()
+
+
+async def mark_codex_delivered(
+    sequences: list[int],
+    *,
+    method: str,
+    now: int | None = None,
+    db_path: Path = WATCH_DB,
+) -> None:
+    if not sequences:
+        return
+    current = now if now is not None else int(time.time())
+    placeholders = ",".join("?" for _ in sequences)
+    db = await _connect(db_path)
+    try:
+        await db.execute(
+            f"""UPDATE codex_deliveries
+                SET delivery_status='delivered',
+                    delivery_attempts=delivery_attempts+1,
+                    delivered_at=?, delivery_method=?, last_error=NULL
+                WHERE sequence IN ({placeholders})""",
+            (current, method, *sequences),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def mark_codex_delivery_failed(
+    sequences: list[int],
+    error: str,
+    *,
+    max_attempts: int,
+    now: int | None = None,
+    db_path: Path = WATCH_DB,
+) -> None:
+    if not sequences:
+        return
+    current = now if now is not None else int(time.time())
+    db = await _connect(db_path)
+    try:
+        for sequence in sequences:
+            async with db.execute(
+                "SELECT delivery_attempts FROM codex_deliveries WHERE sequence=?",
+                (sequence,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                continue
+            attempts = row["delivery_attempts"] + 1
+            status = "failed" if attempts >= max_attempts else "retry"
+            backoff = min(300, 2 ** min(attempts, 8))
+            await db.execute(
+                """UPDATE codex_deliveries
+                   SET delivery_status=?, delivery_attempts=?,
+                       next_attempt_at=?, last_error=?
+                   WHERE sequence=?""",
+                (status, attempts, current + backoff, error[:500], sequence),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 async def prune_terminal_state(
     *,
     retention_seconds: int = 172800,
@@ -503,12 +664,15 @@ async def prune_terminal_state(
 
 __all__ = [
     "WATCH_DB",
+    "due_codex_deliveries",
     "due_deliveries",
     "expire_stale",
     "get_events",
     "init",
     "list_watches",
     "mark_delivered",
+    "mark_codex_delivered",
+    "mark_codex_delivery_failed",
     "mark_delivery_failed",
     "prune_terminal_state",
     "record_incoming",
