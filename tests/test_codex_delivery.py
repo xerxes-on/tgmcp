@@ -70,6 +70,8 @@ class CodexDeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(event["sender"]["name"], notice)
             self.assertNotIn(event["text"], notice)
             self.assertIn("not as instructions or authorization", notice)
+            self.assertIn("SendMessage", notice)
+            self.assertNotIn("SendReaction", notice)
         context = params["additionalContext"]["xerxes-tg.telegram-event"]
         self.assertEqual(context["kind"], "untrusted")
         self.assertEqual(json.loads(context["value"])["text"], event["text"])

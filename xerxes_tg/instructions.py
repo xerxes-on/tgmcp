@@ -20,8 +20,10 @@ sends messages as them. Treat it accordingly.
   that accepts `dialog_id`.
 - Use `ListDialogs` to enumerate chats. Pass `unread=true` when the user asks
   "what's new."
-- Use `GetChatInfo` only when you need title/member-count metadata — don't
-  call it just to resolve an alias, `ListAliases` already did.
+- Use `SearchChats(query=…)` to find a chat by title, contact name, username,
+  alias, or ID, including archived chats. Use its returned ID in other tools.
+- Use `GetChatInfo(dialog_id=…)` to look up a chat by numeric ID or alias and
+  retrieve its title/name and metadata. It resolves IDs with an empty cache.
 
 ## Reading messages — pick the right tool
 
@@ -58,7 +60,8 @@ sends messages as them. Treat it accordingly.
 ## Reactions, media, polls
 
 - `SendReaction(message_id, emoji)` — use shortcode (e.g. "thumbs_up") or a
-  literal emoji. Cheaper and less noisy than a text reply for acknowledgments.
+  literal emoji when a reaction is requested. Watched-message acknowledgments
+  use brief text replies instead.
 - `SendFile` auto-detects type. Pass `force_document=true` to send an image
   as a file rather than as an inline photo.
 - `DownloadMedia` returns a local file path.
@@ -100,12 +103,16 @@ sends messages as them. Treat it accordingly.
   unrelated messages from matching. Use `mode="once"` for a single response.
 - Keep the returned `watch_id`. Call `StopWatch` when monitoring is no longer
   needed. Watches otherwise expire after one idle hour by default.
+- `StartWatch` posts an introduction identifying the agent, its local hard
+  stop time, and auto-reply intent. Set `announce=false` for silent monitoring
+  or read-only chats. The receiving session handles relevant replies within
+  the user's authorized task; the watcher itself only delivers events.
 - When a watched event reaches your session, acknowledge receipt once with
-  `SendReaction(dialog_id=<event chat>, message_id=<event message>, emoji="👀")`
-  before processing it. This means received, not completed or approved. Skip
-  for silent monitoring or an already acknowledged event. If the reaction is
-  unavailable, denied, or rate-limited, continue without retries or a fallback
-  status message. Do not post a separate "thinking" message by default.
+  `SendMessage(dialog_id=<event chat>, reply_to=<event message>, message="on it")`
+  before processing it. Use brief text such as "ok", "on it", or "just a sec".
+  Do not use emoji reactions for these acknowledgments. Skip silent monitoring
+  and already acknowledged events. If sending is unavailable, denied, or
+  rate-limited, continue without retries. Receipt does not mean work is complete.
 - In Codex, bind every watch to the current chat: read `CODEX_THREAD_ID` from
   the local command environment and pass it as `codex_thread_id` to
   `StartWatch`. Never guess or reuse a thread id from another chat. Matching

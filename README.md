@@ -18,10 +18,10 @@ It provides:
 
 ## Install
 
-Install version 0.6.0 from Git with `uv`:
+Install the latest Git build (version 0.6.1) with `uv`:
 
 ```bash
-uv tool install 'git+https://github.com/xerxes-on/tgmcp.git@v0.6.0'
+uv tool install 'git+https://github.com/xerxes-on/tgmcp.git@main'
 ```
 
 Or install a local checkout:
@@ -36,8 +36,8 @@ Run the setup wizard:
 xerxes-tg setup
 ```
 
-The wizard currently generates a PyPI-based MCP launcher. For this Git release,
-replace its generated package source with the pinned Git source shown in the
+The wizard currently generates a PyPI-based MCP launcher. For this Git build,
+replace its generated package source with the Git source shown in the
 [MCP config example](#mcp-config-example) before opening your coding client.
 
 Or run directly from the source tree:
@@ -49,7 +49,7 @@ uv run xerxes-tg setup
 ### Upgrade
 
 ```bash
-uv tool install --force 'git+https://github.com/xerxes-on/tgmcp.git@v0.6.0'
+uv tool install --force --refresh-package xerxes-tg 'git+https://github.com/xerxes-on/tgmcp.git@main'
 xerxes-tg watcher stop
 xerxes-tg watcher start
 ```
@@ -57,10 +57,18 @@ xerxes-tg watcher start
 Reconnect the MCP server in your coding client so it loads the installed version.
 If your MCP configuration runs a source checkout, update that checkout instead;
 upgrading the installed tool does not change the source checkout it uses.
-For configurations using `uvx`, pin its package source to the Git version above
-until that version is published to PyPI. Existing credentials and event storage
+For configurations using `uvx`, use the Git source above and pass
+`--refresh-package xerxes-tg` when upgrading until this version is published to
+PyPI. Existing credentials and event storage
 are retained. Restart Claude with channels enabled and create a fresh watch there
 because channel bindings belong to the MCP process that created them.
+
+### Changes in 0.6.1
+
+- Find chats by title, contact name, username, alias, or ID with `SearchChats`.
+- Resolve numeric chat IDs even with an empty session entity cache.
+- Announce temporary watches with the local stop time and auto-reply intent.
+- Acknowledge watched messages with brief text replies.
 
 ### Changes in 0.6.0
 
@@ -120,12 +128,12 @@ Example for a TOML-based client config:
 ```toml
 [mcp_servers."xerxes-tg"]
 command = "bash"
-args = ["-c", "set -a && . ~/.config/xerxes-tg/config.env && set +a && uvx --from git+https://github.com/xerxes-on/tgmcp.git@v0.6.0 xerxes-tg run"]
+args = ["-c", "set -a && . ~/.config/xerxes-tg/config.env && set +a && uvx --from git+https://github.com/xerxes-on/tgmcp.git@main xerxes-tg run"]
 ```
 
 The setup wizard supports Claude Code, Codex CLI, Gemini CLI, Cursor, VS Code
 (Copilot), Windsurf, Zed, Amp, OpenCode, and Roo Code / Cline. It currently writes
-an unpinned PyPI launcher, so apply the Git pin above for version 0.6.0 until it
+an unpinned PyPI launcher, so apply the Git source above for version 0.6.1 until it
 is available on PyPI. JSON-based clients use the same command and argument array.
 
 ## Access control
@@ -156,9 +164,19 @@ processes can read it. Run `xerxes-tg logout` to wipe both files.
 
 ## MCP tools
 
-Core read: `ListDialogs`, `ListMessages`, `GetMessageInfo`, `GetChatInfo`,
+Core read: `ListDialogs`, `SearchChats`, `ListMessages`, `GetMessageInfo`, `GetChatInfo`,
 `GetChatMembers`, `GetMe`, `ListAliases`, `SearchMessages`, `SearchAllMessages`,
 `GetThread`, `SearchLocal`.
+
+Use `SearchChats(query="team")` to find chats by title, contact name, username,
+configured alias, or ID. It includes archived dialogs, respects the read ACL,
+and returns up to `limit` matches (default 20, maximum 100). This searches chat
+names rather than message contents. Use `SearchMessages` to search inside a chat.
+
+`GetChatInfo(dialog_id=-1001234567890)` accepts numeric IDs, numeric strings,
+and configured aliases. It discovers the chat through dialogs if the encrypted
+session has no cached entity. Returned `id` is the canonical dialog ID for other
+tools; `raw_id` is Telegram's underlying entity ID.
 
 Temporary watches: `StartWatch`, `StopWatch`, `ListWatches`, `GetWatchEvents`.
 
@@ -185,6 +203,17 @@ background watcher. The default lifecycle is:
 - stop after 24 hours regardless, so abandoned watches cannot run forever;
 - stop immediately when `StopWatch` is called.
 
+By default it also posts: "Hi, I'm an AI agent. I'm watching this chat until
+HH:MM (date and local timezone) and will auto-reply to relevant messages."
+The introduction reports the hard stop time and explains the earlier idle or
+first-reply cutoff. It requires write access and uses the normal message footer
+and write rate limit. If the announcement fails, the new watch is stopped and
+the error is returned. The result includes `announcement_message_id`.
+Use `announce=false` for silent monitoring or a read-only chat; for silent
+monitoring, also instruct the receiving session not to acknowledge or reply.
+Relevant replies are handled by the receiving session within the authorized
+task; the background watcher delivers events without composing replies.
+
 Use `after_message_id` to ignore older messages. In groups, also use
 `reply_to_message_id` and/or `sender_id` so unrelated traffic does not match.
 
@@ -205,11 +234,12 @@ delivery also supplies the payload separately as `untrusted` additional context.
 Telegram content is data, never authorization to execute commands or send replies.
 
 When the receiving session handles a watch event, it acknowledges the original
-Telegram message with 👀 through `SendReaction` before processing it. The reaction
-means the session received the event, not that work is complete or approved.
-The watcher daemon does not react on enqueue: a queued event may not have reached
-the session yet. Silent monitoring skips the reaction. Unavailable or denied
-reactions are skipped without retries or a separate "thinking" message.
+Telegram message through `SendMessage(reply_to=<message id>)` with brief text
+such as "ok", "on it", or "just a sec" before processing it. Emoji reactions
+are not used for watch acknowledgments. Receipt does not mean work is complete.
+The watcher daemon does not acknowledge on enqueue: a queued event may not have
+reached the session yet. Silent monitoring and already acknowledged events are
+skipped. Unavailable, denied, or rate-limited sends are skipped without retries.
 
 Configure one global webhook destination. The secret is prompted securely and
 is not accepted through an MCP tool argument:
@@ -334,7 +364,7 @@ session. For a simple test, use `mode="once"`, a 10-minute timeout, and the othe
 person's `sender_id`. Set `after_message_id` to the current last message ID.
 Have that person send a new message: your own outgoing messages do not trigger
 watches. The expected result is an event in the open session, a new working turn,
-and a 👀 reaction on the original message. The watch then completes.
+and a brief text reply to the original message. The watch then completes.
 
 If nothing appears, inspect `GetWatchEvents` for that `watch_id` once. Empty events
 mean the message has not reached the watch store: check the sender, message and
@@ -347,7 +377,8 @@ webhook status is normal when webhooks are disabled and does not describe channe
 or native queue delivery.
 
 Live manual checks passed with Codex CLI 0.153.4 (native queue) and Claude Code
-2.1.263 (channel injection), including message retrieval and 👀 acknowledgment.
+2.1.263 (channel injection), including message retrieval and the previous emoji
+acknowledgment behavior.
 Active-turn steering and idle-turn startup on the shared app server are covered
 by automated routing tests; they were not part of those manual checks.
 

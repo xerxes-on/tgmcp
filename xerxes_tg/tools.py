@@ -88,7 +88,19 @@ async def _get_entity(client: TelegramClient, entity: int | str):  # noqa: ANN20
         except ValueError:
             pass
 
-    return await client.get_entity(_resolve_entity_ref(entity))
+    ref = _resolve_entity_ref(entity)
+    try:
+        return await client.get_entity(ref)
+    except ValueError:
+        if not isinstance(ref, int):
+            raise
+        # Encrypted sessions do not retain the entity cache across processes.
+        async for dialog in client.iter_dialogs():
+            if dialog.id == ref:
+                return dialog.entity
+        raise ValueError(
+            f"Chat {ref} could not be resolved. SearchChats can find accessible chat IDs."
+        ) from None
 
 
 def _theme_params(raw: str | None) -> types.DataJSON | None:
@@ -170,6 +182,67 @@ async def list_dialogs(
             response.append(TextContent(type="text", text=msg))
 
     return response
+
+
+### SearchChats ###
+
+
+class SearchChats(ToolArgs):
+    """Find existing chats by title, contact name, username, alias, or chat ID.
+
+    Searches all dialogs, including archived chats, within the read ACL.
+    Returns usable dialog IDs for GetChatInfo, ListMessages, and StartWatch.
+    This searches chats, not message contents; use SearchMessages for those.
+    """
+
+    query: str
+    limit: int = 20
+
+
+@tool_runner.register
+async def search_chats(
+    args: SearchChats,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    query = args.query.strip().casefold()
+    if not query:
+        raise ValueError("query cannot be empty")
+    if not 1 <= args.limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+
+    allowed = get_allowed_chat_ids()
+    no_matches = TextContent(type="text", text=f"No chats found matching {args.query!r}")
+    remaining = set(allowed) if allowed is not None else None
+    if remaining is not None and not remaining:
+        return [no_matches]
+    aliases_by_id: dict[int, list[str]] = {}
+    for alias, did in get_aliases().items():
+        aliases_by_id.setdefault(did, []).append(alias)
+
+    response: list[TextContent] = []
+    async with create_client() as client:
+        async for dialog in client.iter_dialogs():
+            if remaining is not None:
+                if dialog.id not in remaining:
+                    continue
+                remaining.remove(dialog.id)
+            entity = dialog.entity
+            username = getattr(entity, "username", None)
+            aliases = aliases_by_id.get(dialog.id, [])
+            names = [dialog.name or "", f"@{username}" if username else "", *aliases, str(dialog.id)]
+            if any(query in name.casefold() for name in names):
+                result = {
+                    "id": dialog.id,
+                    "name": dialog.name,
+                    "username": f"@{username}" if username else None,
+                    "type": type(entity).__name__,
+                    "aliases": aliases,
+                    "unread": dialog.unread_count,
+                }
+                response.append(TextContent(type="text", text=json.dumps(result, ensure_ascii=False)))
+            if len(response) >= args.limit or (remaining is not None and not remaining):
+                break
+
+    return response or [no_matches]
 
 
 ### ListMessages ###
@@ -937,7 +1010,12 @@ async def search_messages(
 
 
 class GetChatInfo(ToolArgs):
-    """Get information about a chat/channel/user including title, members count, description, and photo."""
+    """Look up a chat/channel/user by numeric dialog ID or configured alias.
+
+    Accepts integer IDs and numeric strings, including -100… channel IDs.
+    Returns the canonical dialog ID, title/name, username, and known metadata.
+    Works even when the session's entity cache is empty.
+    """
 
     dialog_id: int | str
 
@@ -951,8 +1029,8 @@ async def get_chat_info(
     check_access(did, "read")
 
     async with create_client() as client:
-        entity = await client.get_entity(did)
-        info_parts = [f"id={entity.id}"]
+        entity = await _get_entity(client, did)
+        info_parts = [f"id={utils.get_peer_id(entity)}", f"raw_id={entity.id}"]
 
         if hasattr(entity, "title"):
             info_parts.append(f"title={entity.title}")
@@ -1453,6 +1531,10 @@ class StartWatch(ToolArgs):
     the first match, or ``mode='conversation'`` to renew the idle deadline on
     every match. Webhook destinations and secrets come only from local config.
 
+    By default, posts an introduction with the local hard stop time and the
+    auto-reply intent. Requires write access; set ``announce=False`` for a
+    silent/read-only watch. Replies are handled by the receiving session.
+
     In Codex, bind the watch to the originating chat by passing that chat's
     ``CODEX_THREAD_ID`` as ``codex_thread_id``. The server also auto-detects
     that environment value when the MCP process inherits it.
@@ -1466,13 +1548,15 @@ class StartWatch(ToolArgs):
     mode: t.Literal["once", "conversation"] = "conversation"
     idle_timeout_seconds: int = 3600
     max_duration_seconds: int = 86400
+    announce: bool = True
 
 
 @tool_runner.register
 async def start_watch_tool(
     args: StartWatch,
 ) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
-    from . import channel, codex_delivery, watch_store, watcher
+    from . import channel, codex_delivery, ratelimit, watch_store, watcher
+    from .watch_notice import watch_announcement
     from .webhook import WebhookConfig
 
     did = resolve_dialog_id(args.dialog_id)
@@ -1485,6 +1569,8 @@ async def start_watch_tool(
         raise ValueError("idle_timeout_seconds must be at least 30")
     if args.max_duration_seconds < args.idle_timeout_seconds:
         raise ValueError("max_duration_seconds must be at least idle_timeout_seconds")
+    if args.announce:
+        check_access(did, "write")
 
     codex_thread_id = codex_delivery.current_thread_id(args.codex_thread_id)
     watch = await watch_store.start_watch(
@@ -1503,11 +1589,29 @@ async def start_watch_tool(
         await watch_store.stop_watch(watch["watch_id"], reason="watcher_start_failed")
         raise
 
+    announcement_id = None
+    if args.announce:
+        try:
+            ratelimit.check_and_consume("write", did)
+            async with create_client() as client:
+                entity = await _get_entity(client, did)
+                sent = await client.send_message(
+                    entity=entity,
+                    message=_add_footer(watch_announcement(watch)),
+                    parse_mode="md",
+                    link_preview=False,
+                )
+            announcement_id = sent.id
+        except Exception:
+            await watch_store.stop_watch(watch["watch_id"], reason="announcement_failed")
+            raise
+
     channel_registered = channel.register_watch(watch["watch_id"])
     config = WebhookConfig.load()
     result = {
         **watch,
         "watcher_pid": pid,
+        "announcement_message_id": announcement_id,
         "webhook_configured": config.enabled,
         "codex_chat_delivery": {
             "configured": codex_thread_id is not None,
