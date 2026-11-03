@@ -45,7 +45,8 @@ sends messages as them. Treat it accordingly.
   session**, especially when the destination was inferred (e.g. "the dev
   group"). Cite the alias you're about to send to.
 - Default `parse_mode` is `md`. Messages are auto-tagged with a `sent via
-  agent` footer — do not add your own "— bot" / "— claude" line.
+  agent` footer, except in chats with bots, where text and captions are sent
+  unchanged — do not add your own "— bot" / "— claude" line.
 - Scheduled sends: pass `send_at` to `SendMessage`. Accepted formats:
   `+10m`, `+2h`, `+3d`, `tomorrow 09:00`, `today 18:30`, ISO-8601. Response
   reports the scheduled time.

@@ -18,7 +18,7 @@ It provides:
 
 ## Install
 
-Install the latest Git build (version 0.6.1) with `uv`:
+Install the latest Git build (version 0.6.2) with `uv`:
 
 ```bash
 uv tool install 'git+https://github.com/xerxes-on/tgmcp.git@main'
@@ -62,6 +62,12 @@ For configurations using `uvx`, use the Git source above and pass
 PyPI. Existing credentials and event storage
 are retained. Restart Claude with channels enabled and create a fresh watch there
 because channel bindings belong to the MCP process that created them.
+
+### Changes in 0.6.2
+
+- Skip the automatic footer in chats with bots, keeping commands such as
+  `/revoke`, replies, edited text, and file captions unchanged.
+- Keep the footer for people, groups, and channels.
 
 ### Changes in 0.6.1
 

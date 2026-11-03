@@ -120,7 +120,9 @@ _DEFAULT_BACKGROUND_UPLOAD_MB = 0
 _AGENT_FOOTER = "\n\n`sent via agent`"
 
 
-def _add_footer(text: str) -> str:
+def _add_footer(text: str, entity: types.TypeUser | types.TypeChat | int) -> str:
+    if isinstance(entity, types.User) and entity.bot:
+        return text
     return text.rstrip() + _AGENT_FOOTER if text.strip() else "`sent via agent`"
 
 
@@ -346,7 +348,6 @@ async def send_message(
     did = resolve_dialog_id(args.dialog_id)
     check_access(did, "write")
 
-    msg = args.message.rstrip() + "\n\n`sent via agent`"
     parse_mode = args.parse_mode if args.parse_mode else None
 
     schedule_dt: datetime | None = None
@@ -356,9 +357,10 @@ async def send_message(
             raise ValueError(f"send_at must be in the future (got {schedule_dt.isoformat()})")
 
     async with create_client() as client:
+        entity = await _get_entity(client, did) if did > 0 else did
         result = await client.send_message(
-            entity=did,
-            message=msg,
+            entity=entity,
+            message=_add_footer(args.message, entity),
             parse_mode=parse_mode,
             reply_to=args.reply_to,
             link_preview=args.link_preview,
@@ -391,10 +393,11 @@ async def edit_message(
 
     parse_mode = args.parse_mode if args.parse_mode else None
     async with create_client() as client:
+        entity = await _get_entity(client, did) if did > 0 else did
         result = await client.edit_message(
-            entity=did,
+            entity=entity,
             message=args.message_id,
-            text=_add_footer(args.new_text),
+            text=_add_footer(args.new_text, entity),
             parse_mode=parse_mode,
         )
         return [TextContent(type="text", text=f"Message edited. id={result.id}")]
@@ -534,10 +537,11 @@ async def send_file(
         ]
 
     async with create_client() as client:
+        entity = await _get_entity(client, did) if did > 0 else did
         result = await client.send_file(
-            entity=did,
+            entity=entity,
             file=args.file_path,
-            caption=_add_footer(args.caption),
+            caption=_add_footer(args.caption, entity),
             reply_to=args.reply_to,
             force_document=args.force_document,
         )
@@ -554,10 +558,11 @@ def _background_upload_threshold_bytes() -> int:
 
 async def _send_file_background(did: int, args: SendFile) -> None:
     async with create_ephemeral_client() as client:
+        entity = await _get_entity(client, did) if did > 0 else did
         result = await client.send_file(
-            entity=did,
+            entity=entity,
             file=args.file_path,
-            caption=_add_footer(args.caption),
+            caption=_add_footer(args.caption, entity),
             reply_to=args.reply_to,
             force_document=args.force_document,
         )
@@ -1456,10 +1461,10 @@ async def reply_to(
             raise ValueError("No message matched the given predicate.")
 
         parse_mode = args.parse_mode if args.parse_mode else None
-        body = args.text.rstrip() + "\n\n`sent via agent`"
+        entity = await _get_entity(client, did) if did > 0 else did
         result = await client.send_message(
-            entity=did,
-            message=body,
+            entity=entity,
+            message=_add_footer(args.text, entity),
             parse_mode=parse_mode,
             reply_to=matched.id,
         )
@@ -1597,7 +1602,7 @@ async def start_watch_tool(
                 entity = await _get_entity(client, did)
                 sent = await client.send_message(
                     entity=entity,
-                    message=_add_footer(watch_announcement(watch)),
+                    message=_add_footer(watch_announcement(watch), entity),
                     parse_mode="md",
                     link_preview=False,
                 )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import tempfile
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
@@ -25,6 +27,8 @@ class _Client:
         self.visited_dialogs = []
         self.get_entity = AsyncMock(return_value=entity)
         self.send_message = AsyncMock(return_value=SimpleNamespace(id=77))
+        self.edit_message = AsyncMock(return_value=SimpleNamespace(id=77))
+        self.send_file = AsyncMock(return_value=SimpleNamespace(id=77))
 
     async def __aenter__(self):
         return self
@@ -37,6 +41,67 @@ class _Client:
         for dialog in self.dialogs:
             self.visited_dialogs.append(dialog.id)
             yield dialog
+
+
+class MessageFooterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outgoing_text_and_captions_use_recipient_bot_flag(self):
+        recipients = [
+            types.User(id=7, first_name="Service", bot=True, username="Service"),
+            types.User(id=8, first_name="Person", username="PersonBot"),
+            types.Chat(id=42, title="Team", photo=types.ChatPhotoEmpty(),
+                       participants_count=5, date=None, version=1),
+            types.Channel(id=123, title="News", photo=types.ChatPhotoEmpty(),
+                          date=None, broadcast=True, access_hash=456),
+        ]
+        async def messages(**kwargs):
+            yield SimpleNamespace(id=55)
+
+        with tempfile.NamedTemporaryFile() as upload:
+            for entity in recipients:
+                did = utils.get_peer_id(entity)
+                client = _Client(entity=entity)
+                client.iter_messages = messages
+                for body in ["/revoke  ", ""]:
+                    expected = body if getattr(entity, "bot", False) else (
+                        body.rstrip() + "\n\n`sent via agent`" if body.strip()
+                        else "`sent via agent`"
+                    )
+                    operations = [
+                        (tools.SendMessage(dialog_id=did, message=body, reply_to=12,
+                                           send_at="+10m"), client.send_message, "message"),
+                        (tools.EditMessage(dialog_id=did, message_id=77, new_text=body),
+                         client.edit_message, "text"),
+                        (tools.ReplyTo(dialog_id=did, text=body), client.send_message, "message"),
+                        (tools.SendFile(dialog_id=did, file_path=upload.name, caption=body,
+                                        wait_for_upload=True), client.send_file, "caption"),
+                        (tools.SendFile(dialog_id=did, file_path=upload.name, caption=body),
+                         client.send_file, "caption"),
+                    ]
+                    for args, sender, field in operations:
+                        with (
+                            self.subTest(entity=type(entity).__name__, did=did, body=body,
+                                         operation=type(args).__name__,
+                                         wait=getattr(args, "wait_for_upload", None)),
+                            patch.object(tools, "create_client", return_value=client),
+                            patch.object(tools, "create_ephemeral_client", return_value=client),
+                            patch.object(tools, "check_access"),
+                        ):
+                            sender.reset_mock()
+                            await tools.tool_runner(args)
+                            if isinstance(args, tools.SendFile) and not args.wait_for_upload:
+                                await asyncio.gather(*tools._BACKGROUND_UPLOADS)
+                            sent = sender.await_args.kwargs
+                            self.assertEqual(sent[field], expected)
+                            if did > 0:
+                                self.assertIs(sent["entity"], entity)
+                            else:
+                                self.assertEqual(sent["entity"], did)
+                                client.get_entity.assert_not_awaited()
+                            if isinstance(args, tools.SendMessage):
+                                self.assertEqual(sent["reply_to"], 12)
+                                self.assertIsNotNone(sent["schedule"])
+                            elif isinstance(args, tools.ReplyTo):
+                                self.assertEqual(sent["reply_to"], 55)
 
 
 class ChatDiscoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -175,6 +240,12 @@ class WatchToolTests(unittest.IsolatedAsyncioTestCase):
         self.consume.assert_not_called()
         self.client.send_message.assert_not_awaited()
         self.assertIsNone(json.loads(result[0].text)["announcement_message_id"])
+
+    async def test_bot_watch_announcement_skips_footer(self):
+        self.client.get_entity.return_value = types.User(id=42, bot=True)
+        await tools.start_watch_tool(tools.StartWatch(dialog_id=42))
+        self.assertEqual(self.client.send_message.await_args.kwargs["message"],
+                         watch_announcement(self.watch))
 
     async def test_read_only_chat_rejects_announcement_before_creating_watch(self):
         self.access.side_effect = [None, PermissionError("Read only")]
